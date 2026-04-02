@@ -1,0 +1,81 @@
+{{template "header" .}}
+
+{{with .Data}}
+<div class="video-page">
+    <div class="video-player-container">
+        <video id="videoPlayer" controls preload="metadata" class="video-player"
+               poster="/thumbs/{{.Hash}}/{{.MainThumbFilename}}">
+            <source src="/media/{{.Hash}}" type="video/mp4">
+            Your browser does not support the video element.
+        </video>
+    </div>
+
+    <div class="video-controls-extra">
+        <a href="/media/{{.Hash}}" class="btn btn-secondary" download="{{.Filename}}"
+           title="Download or open in external player">
+            ⬇ Download / Open Externally
+        </a>
+        <button onclick="toggleThumbPicker()" class="btn btn-secondary">
+            🖼 Choose Thumbnail
+        </button>
+    </div>
+
+    <!-- Thumbnail picker popup -->
+    <div id="thumbPicker" class="thumb-picker hidden">
+        <div class="thumb-picker-header">
+            <h3>Select Main Thumbnail</h3>
+            <button onclick="toggleThumbPicker()" class="btn btn-sm btn-secondary">&times; Close</button>
+        </div>
+        <div id="thumbPickerGrid" class="thumb-picker-grid">
+        </div>
+    </div>
+
+    <div class="video-info">
+        <h1 class="video-title">{{.Filename}}</h1>
+        <div class="video-meta">
+            <span class="meta-item">📁 {{.Directory}}</span>
+            <span class="meta-item">⏱ {{.DurationString}}</span>
+            <span class="meta-item">📐 {{.Width}}x{{.Height}}</span>
+            <span class="meta-item">💾 {{.SizeString}}</span>
+        </div>
+
+        <div class="tag-editor">
+            <h3>Tags</h3>
+            <div id="tagContainer" class="tag-container">
+                {{range .Tags}}
+                <span class="tag" data-tag="{{.}}">
+                    {{.}}
+                    <button class="tag-remove" onclick="removeTag('{{$.Hash}}', '{{.}}')">&times;</button>
+                </span>
+                {{end}}
+            </div>
+            <div class="tag-input-row">
+                <input type="text" id="newTagInput" placeholder="Add tags (comma separated)..."
+                       onkeyup="if(event.key==='Enter')addTagsToVideo()">
+                <button onclick="addTagsToVideo()" class="btn btn-primary btn-sm">Add Tags</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="similarVideos" class="similar-videos">
+        <h3>Similar Videos</h3>
+        <div id="similarGrid" class="video-grid video-grid-small">
+        </div>
+    </div>
+</div>
+
+<script>
+    var currentHash = "{{.Hash}}";
+    var currentTags = [{{range $i, $t := .Tags}}{{if $i}},{{end}}"{{$t}}"{{end}}];
+    var currentMainThumb = {{.MainThumbIndex}};
+
+    document.addEventListener('DOMContentLoaded', function() {
+        if (currentTags.length > 0) {
+            loadSimilarVideos(currentHash, currentTags);
+        }
+        loadThumbPicker(currentHash);
+    });
+</script>
+{{end}}
+
+{{template "footer" .}}

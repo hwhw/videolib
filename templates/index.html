@@ -1,0 +1,40 @@
+{{template "header" .}}
+
+<div class="search-bar">
+    <input type="text" id="searchInput"
+           placeholder="Search: filename, tag:value, UNTAGGED, AND/OR/NOT, wildcards*..."
+           autocomplete="off">
+    <button onclick="doSearch()" class="btn btn-primary">Search</button>
+    <button onclick="clearSearch()" class="btn btn-secondary">Clear</button>
+    <span id="resultCount" class="result-count"></span>
+</div>
+
+<div class="search-help">
+    <details>
+        <summary>Search syntax help</summary>
+        <div class="help-content">
+            <p><code>action</code> — full-text search in filenames/paths</p>
+            <p><code>action*</code> — prefix/truncated search</p>
+            <p><code>genre:action</code> — exact tag match</p>
+            <p><code>starring:cloon*</code> — tag wildcard</p>
+            <p><code>UNTAGGED</code> — videos with no tags</p>
+            <p><code>genre:action AND starring:clooney</code> — boolean AND</p>
+            <p><code>genre:action OR genre:comedy</code> — boolean OR</p>
+            <p><code>NOT starring:pitt</code> — exclusion</p>
+            <p><code>(UNTAGGED OR genre:action) AND NOT starring:pitt*</code> — grouping</p>
+        </div>
+    </details>
+</div>
+
+<div id="bulkBar" class="bulk-bar hidden">
+    <span id="selectedCount">0</span> selected
+    <input type="text" id="bulkTagInput" placeholder="Tags to add/remove (comma separated)...">
+    <button onclick="bulkAddTags()" class="btn btn-sm btn-primary">+ Add Tags</button>
+    <button onclick="bulkRemoveTags()" class="btn btn-sm btn-danger">- Remove Tags</button>
+    <button onclick="clearSelection()" class="btn btn-sm btn-secondary">Cancel</button>
+</div>
+
+<div id="videoGrid" class="video-grid">
+</div>
+
+{{template "footer" .}}

@@ -1,0 +1,26 @@
+{{define "header"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <a href="/" class="nav-brand">📼 {{.Title}}</a>
+        <div class="nav-links">
+            <a href="/">Browse</a>
+            <a href="/tags">Tags</a>
+        </div>
+    </nav>
+    <main class="container">
+{{end}}
+
+{{define "footer"}}
+    </main>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
+{{end}}

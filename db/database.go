@@ -1,0 +1,975 @@
+package db
+
+import (
+	"database/sql"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"videolib/models"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+type Database struct {
+	db *sql.DB
+}
+
+func Open(path string) (*Database, error) {
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on")
+	if err != nil {
+		return nil, fmt.Errorf("opening database: %w", err)
+	}
+
+	d := &Database{db: db}
+	if err := d.migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migration: %w", err)
+	}
+
+	return d, nil
+}
+
+func (d *Database) Close() error {
+	return d.db.Close()
+}
+
+func (d *Database) migrate() error {
+	migrations := []string{
+		`CREATE TABLE IF NOT EXISTS videos (
+			hash TEXT PRIMARY KEY,
+			path TEXT NOT NULL UNIQUE,
+			filename TEXT NOT NULL,
+			directory TEXT NOT NULL,
+			size INTEGER NOT NULL DEFAULT 0,
+			duration REAL NOT NULL DEFAULT 0,
+			width INTEGER NOT NULL DEFAULT 0,
+			height INTEGER NOT NULL DEFAULT 0,
+			thumb_count INTEGER NOT NULL DEFAULT 0,
+			main_thumb INTEGER NOT NULL DEFAULT -1,
+			added_at TEXT NOT NULL,
+			modified_at TEXT NOT NULL,
+			file_mod_time TEXT NOT NULL
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS tags (
+			hash TEXT NOT NULL,
+			tag TEXT NOT NULL,
+			PRIMARY KEY (hash, tag),
+			FOREIGN KEY (hash) REFERENCES videos(hash) ON DELETE CASCADE
+		)`,
+
+		`CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag)`,
+		`CREATE INDEX IF NOT EXISTS idx_tags_hash ON tags(hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_videos_path ON videos(path)`,
+		`CREATE INDEX IF NOT EXISTS idx_videos_directory ON videos(directory)`,
+
+		// FTS5 virtual table for full-text search on filename and path
+		`CREATE VIRTUAL TABLE IF NOT EXISTS videos_fts USING fts5(
+			hash UNINDEXED,
+			filename,
+			path,
+			directory,
+			content='videos',
+			content_rowid='rowid',
+			tokenize='unicode61 remove_diacritics 2'
+		)`,
+
+		// Triggers to keep FTS in sync
+		`CREATE TRIGGER IF NOT EXISTS videos_ai AFTER INSERT ON videos BEGIN
+			INSERT INTO videos_fts(rowid, hash, filename, path, directory)
+			VALUES (new.rowid, new.hash, new.filename, new.path, new.directory);
+		END`,
+
+		`CREATE TRIGGER IF NOT EXISTS videos_ad AFTER DELETE ON videos BEGIN
+			INSERT INTO videos_fts(videos_fts, rowid, hash, filename, path, directory)
+			VALUES ('delete', old.rowid, old.hash, old.filename, old.path, old.directory);
+		END`,
+
+		`CREATE TRIGGER IF NOT EXISTS videos_au AFTER UPDATE ON videos BEGIN
+			INSERT INTO videos_fts(videos_fts, rowid, hash, filename, path, directory)
+			VALUES ('delete', old.rowid, old.hash, old.filename, old.path, old.directory);
+			INSERT INTO videos_fts(rowid, hash, filename, path, directory)
+			VALUES (new.rowid, new.hash, new.filename, new.path, new.directory);
+		END`,
+	}
+
+	for _, m := range migrations {
+		if _, err := d.db.Exec(m); err != nil {
+			return fmt.Errorf("executing migration: %w\nSQL: %s", err, m)
+		}
+	}
+
+	return nil
+}
+
+// === Video CRUD ===
+
+func (d *Database) PutVideo(v *models.Video) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
+		INSERT INTO videos (hash, path, filename, directory, size, duration, width, height,
+			thumb_count, main_thumb, added_at, modified_at, file_mod_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(hash) DO UPDATE SET
+			path=excluded.path, filename=excluded.filename, directory=excluded.directory,
+			size=excluded.size, duration=excluded.duration, width=excluded.width, height=excluded.height,
+			thumb_count=excluded.thumb_count, main_thumb=excluded.main_thumb,
+			modified_at=excluded.modified_at, file_mod_time=excluded.file_mod_time
+	`,
+		v.Hash, v.Path, v.Filename, v.Directory, v.Size, v.Duration, v.Width, v.Height,
+		v.ThumbCount, v.MainThumb,
+		v.AddedAt.Format(time.RFC3339), v.ModifiedAt.Format(time.RFC3339),
+		v.FileModTime.Format(time.RFC3339),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Replace tags
+	_, err = tx.Exec("DELETE FROM tags WHERE hash = ?", v.Hash)
+	if err != nil {
+		return err
+	}
+
+	if len(v.Tags) > 0 {
+		stmt, err := tx.Prepare("INSERT OR IGNORE INTO tags (hash, tag) VALUES (?, ?)")
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+
+		for _, tag := range v.Tags {
+			tag = strings.ToLower(strings.TrimSpace(tag))
+			if tag != "" {
+				if _, err := stmt.Exec(v.Hash, tag); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (d *Database) GetVideo(hash string) (*models.Video, error) {
+	v := &models.Video{}
+	var addedAt, modifiedAt, fileModTime string
+
+	err := d.db.QueryRow(`
+		SELECT hash, path, filename, directory, size, duration, width, height,
+			thumb_count, main_thumb, added_at, modified_at, file_mod_time
+		FROM videos WHERE hash = ?
+	`, hash).Scan(
+		&v.Hash, &v.Path, &v.Filename, &v.Directory, &v.Size, &v.Duration,
+		&v.Width, &v.Height, &v.ThumbCount, &v.MainThumb,
+		&addedAt, &modifiedAt, &fileModTime,
+	)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("video not found: %s", hash)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	v.AddedAt, _ = time.Parse(time.RFC3339, addedAt)
+	v.ModifiedAt, _ = time.Parse(time.RFC3339, modifiedAt)
+	v.FileModTime, _ = time.Parse(time.RFC3339, fileModTime)
+
+	tags, err := d.getVideoTags(v.Hash)
+	if err != nil {
+		return nil, err
+	}
+	v.Tags = tags
+
+	return v, nil
+}
+
+func (d *Database) DeleteVideo(hash string) error {
+	// Tags deleted by CASCADE
+	_, err := d.db.Exec("DELETE FROM videos WHERE hash = ?", hash)
+	return err
+}
+
+func (d *Database) GetAllPaths() (map[string]string, error) {
+	rows, err := d.db.Query("SELECT path, hash FROM videos")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	paths := make(map[string]string)
+	for rows.Next() {
+		var path, hash string
+		if err := rows.Scan(&path, &hash); err != nil {
+			return nil, err
+		}
+		paths[path] = hash
+	}
+	return paths, rows.Err()
+}
+
+func (d *Database) GetAllHashes() (map[string]bool, error) {
+	rows, err := d.db.Query("SELECT hash FROM videos")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	hashes := make(map[string]bool)
+	for rows.Next() {
+		var hash string
+		if err := rows.Scan(&hash); err != nil {
+			return nil, err
+		}
+		hashes[hash] = true
+	}
+	return hashes, rows.Err()
+}
+
+// === Full-Text Search ===
+
+func (d *Database) FullTextSearch(query string) ([]*models.Video, error) {
+	// Convert user wildcards: * -> FTS5 prefix syntax
+	// "foo*" in FTS5 is written as "foo" with prefix query, or we use the * operator
+	// FTS5 supports: word* for prefix matching
+	// We sanitize the query to be safe for FTS5
+	ftsQuery := sanitizeFTSQuery(query)
+
+	rows, err := d.db.Query(`
+		SELECT v.hash, v.path, v.filename, v.directory, v.size, v.duration,
+			v.width, v.height, v.thumb_count, v.main_thumb,
+			v.added_at, v.modified_at, v.file_mod_time
+		FROM videos_fts f
+		JOIN videos v ON v.hash = f.hash
+		WHERE videos_fts MATCH ?
+		ORDER BY rank
+	`, ftsQuery)
+	if err != nil {
+		return nil, fmt.Errorf("FTS query error: %w (query: %s)", err, ftsQuery)
+	}
+	defer rows.Close()
+
+	return d.scanVideosWithTags(rows)
+}
+
+// sanitizeFTSQuery converts a user search string into a safe FTS5 query.
+// Supports: word, word*, "exact phrase", and implicit AND between terms.
+func sanitizeFTSQuery(input string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return ""
+	}
+
+	var parts []string
+	inQuote := false
+	var current strings.Builder
+
+	for i := 0; i < len(input); i++ {
+		ch := input[i]
+		switch {
+		case ch == '"':
+			if inQuote {
+				current.WriteByte('"')
+				parts = append(parts, current.String())
+				current.Reset()
+				inQuote = false
+			} else {
+				if current.Len() > 0 {
+					parts = append(parts, current.String())
+					current.Reset()
+				}
+				current.WriteByte('"')
+				inQuote = true
+			}
+		case ch == ' ' && !inQuote:
+			if current.Len() > 0 {
+				parts = append(parts, current.String())
+				current.Reset()
+			}
+		case ch == '*':
+			current.WriteByte('*')
+		default:
+			// Allow alphanumeric, underscore, hyphen, dot
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+				(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' {
+				current.WriteByte(ch)
+			}
+		}
+	}
+
+	if current.Len() > 0 {
+		s := current.String()
+		if inQuote {
+			s += `"` // close unclosed quote
+		}
+		parts = append(parts, s)
+	}
+
+	// Join with implicit AND
+	return strings.Join(parts, " AND ")
+}
+
+// === Tag Query Engine ===
+
+// SearchByQuery parses and executes a structured search query.
+// Syntax:
+//
+//	term            - plain text search on filename/path (FTS)
+//	tag:value       - exact tag match
+//	tag:val*        - tag prefix/wildcard match (SQL LIKE)
+//	UNTAGGED        - videos with no tags
+//	AND, OR, NOT    - boolean operators
+//	( )             - grouping
+//
+// Examples:
+//
+//	action                         -> FTS for "action" in filename
+//	genre:action                   -> tag "genre:action"
+//	genre:act*                     -> tags matching "genre:act%"
+//	(UNTAGGED OR genre:action) AND NOT starring:pitt*
+func (d *Database) SearchByQuery(query string) ([]*models.Video, error) {
+	tokens := tokenizeQuery(query)
+	if len(tokens) == 0 {
+		return d.ListAllVideos()
+	}
+
+	parser := &queryParser{tokens: tokens, pos: 0, db: d}
+	sqlWhere, args, err := parser.parseExpression()
+	if err != nil {
+		return nil, fmt.Errorf("query parse error: %w", err)
+	}
+
+	sql := `
+		SELECT DISTINCT v.hash, v.path, v.filename, v.directory, v.size, v.duration,
+			v.width, v.height, v.thumb_count, v.main_thumb,
+			v.added_at, v.modified_at, v.file_mod_time
+		FROM videos v
+		WHERE ` + sqlWhere + `
+		ORDER BY v.filename
+	`
+
+	rows, err := d.db.Query(sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search query error: %w\nSQL: %s\nArgs: %v", err, sql, args)
+	}
+	defer rows.Close()
+
+	return d.scanVideosWithTags(rows)
+}
+
+// Token types for the query parser
+type tokenType int
+
+const (
+	tokWord   tokenType = iota // plain word or tag:value
+	tokAnd                     // AND
+	tokOr                      // OR
+	tokNot                     // NOT
+	tokLParen                  // (
+	tokRParen                  // )
+)
+
+type token struct {
+	typ tokenType
+	val string
+}
+
+func tokenizeQuery(input string) []token {
+	var tokens []token
+	input = strings.TrimSpace(input)
+	i := 0
+
+	for i < len(input) {
+		// Skip whitespace
+		if input[i] == ' ' || input[i] == '\t' {
+			i++
+			continue
+		}
+
+		// Parentheses
+		if input[i] == '(' {
+			tokens = append(tokens, token{tokLParen, "("})
+			i++
+			continue
+		}
+		if input[i] == ')' {
+			tokens = append(tokens, token{tokRParen, ")"})
+			i++
+			continue
+		}
+
+		// Read a word (until space or paren)
+		start := i
+		for i < len(input) && input[i] != ' ' && input[i] != '\t' && input[i] != '(' && input[i] != ')' {
+			i++
+		}
+
+		word := input[start:i]
+		upper := strings.ToUpper(word)
+
+		switch upper {
+		case "AND":
+			tokens = append(tokens, token{tokAnd, "AND"})
+		case "OR":
+			tokens = append(tokens, token{tokOr, "OR"})
+		case "NOT":
+			tokens = append(tokens, token{tokNot, "NOT"})
+		default:
+			tokens = append(tokens, token{tokWord, word})
+		}
+	}
+
+	return tokens
+}
+
+type queryParser struct {
+	tokens []token
+	pos    int
+	db     *Database
+	argIdx int
+}
+
+func (p *queryParser) peek() *token {
+	if p.pos >= len(p.tokens) {
+		return nil
+	}
+	return &p.tokens[p.pos]
+}
+
+func (p *queryParser) next() *token {
+	if p.pos >= len(p.tokens) {
+		return nil
+	}
+	t := &p.tokens[p.pos]
+	p.pos++
+	return t
+}
+
+// parseExpression handles OR (lowest precedence)
+func (p *queryParser) parseExpression() (string, []interface{}, error) {
+	left, args, err := p.parseAnd()
+	if err != nil {
+		return "", nil, err
+	}
+
+	for {
+		t := p.peek()
+		if t == nil || t.typ != tokOr {
+			break
+		}
+		p.next() // consume OR
+
+		right, rightArgs, err := p.parseAnd()
+		if err != nil {
+			return "", nil, err
+		}
+
+		left = "(" + left + " OR " + right + ")"
+		args = append(args, rightArgs...)
+	}
+
+	return left, args, nil
+}
+
+// parseAnd handles AND (medium precedence)
+func (p *queryParser) parseAnd() (string, []interface{}, error) {
+	left, args, err := p.parseUnary()
+	if err != nil {
+		return "", nil, err
+	}
+
+	for {
+		t := p.peek()
+		if t == nil {
+			break
+		}
+
+		// Implicit AND: next token is a word, NOT, or LPAREN (not OR, not RPAREN)
+		if t.typ == tokAnd {
+			p.next() // consume explicit AND
+		} else if t.typ == tokWord || t.typ == tokNot || t.typ == tokLParen {
+			// implicit AND
+		} else {
+			break
+		}
+
+		right, rightArgs, err := p.parseUnary()
+		if err != nil {
+			return "", nil, err
+		}
+
+		left = "(" + left + " AND " + right + ")"
+		args = append(args, rightArgs...)
+	}
+
+	return left, args, nil
+}
+
+// parseUnary handles NOT (high precedence) and atoms
+func (p *queryParser) parseUnary() (string, []interface{}, error) {
+	t := p.peek()
+	if t == nil {
+		return "", nil, fmt.Errorf("unexpected end of query")
+	}
+
+	if t.typ == tokNot {
+		p.next() // consume NOT
+		inner, args, err := p.parseUnary()
+		if err != nil {
+			return "", nil, err
+		}
+		return "NOT (" + inner + ")", args, nil
+	}
+
+	return p.parseAtom()
+}
+
+// parseAtom handles parenthesized expressions and leaf terms
+func (p *queryParser) parseAtom() (string, []interface{}, error) {
+	t := p.peek()
+	if t == nil {
+		return "", nil, fmt.Errorf("unexpected end of query")
+	}
+
+	// Parenthesized sub-expression
+	if t.typ == tokLParen {
+		p.next() // consume (
+		expr, args, err := p.parseExpression()
+		if err != nil {
+			return "", nil, err
+		}
+		closing := p.next()
+		if closing == nil || closing.typ != tokRParen {
+			return "", nil, fmt.Errorf("expected closing parenthesis")
+		}
+		return expr, args, nil
+	}
+
+	// Must be a word
+	if t.typ != tokWord {
+		return "", nil, fmt.Errorf("unexpected token: %s", t.val)
+	}
+	p.next() // consume word
+
+	word := t.val
+
+	// UNTAGGED special keyword
+	if strings.ToUpper(word) == "UNTAGGED" {
+		return "v.hash NOT IN (SELECT DISTINCT hash FROM tags)", nil, nil
+	}
+
+	// tag:value pattern
+	if idx := strings.Index(word, ":"); idx > 0 {
+		tagPattern := strings.ToLower(word)
+		// Check for wildcard
+		if strings.Contains(tagPattern, "*") {
+			likePattern := strings.ReplaceAll(tagPattern, "*", "%")
+			return "v.hash IN (SELECT hash FROM tags WHERE tag LIKE ?)", []interface{}{likePattern}, nil
+		}
+		return "v.hash IN (SELECT hash FROM tags WHERE tag = ?)", []interface{}{tagPattern}, nil
+	}
+
+	// Plain word -> full-text search on filename/path
+	ftsWord := sanitizeFTSWord(word)
+	if ftsWord == "" {
+		return "1=1", nil, nil // no-op for empty/invalid words
+	}
+
+	return `v.hash IN (SELECT hash FROM videos_fts WHERE videos_fts MATCH ?)`,
+		[]interface{}{ftsWord}, nil
+}
+
+func sanitizeFTSWord(word string) string {
+	var b strings.Builder
+	for _, ch := range word {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' {
+			b.WriteRune(ch)
+		} else if ch == '*' {
+			b.WriteRune('*') // FTS5 prefix query
+		}
+	}
+	return b.String()
+}
+
+// === Simple Tag Operations ===
+
+func (d *Database) getVideoTags(hash string) ([]string, error) {
+	rows, err := d.db.Query("SELECT tag FROM tags WHERE hash = ? ORDER BY tag", hash)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tags []string
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			return nil, err
+		}
+		tags = append(tags, tag)
+	}
+	if tags == nil {
+		tags = []string{}
+	}
+	return tags, rows.Err()
+}
+
+func (d *Database) AddTags(hash string, tags []string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO tags (hash, tag) VALUES (?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, t := range tags {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t != "" {
+			if _, err := stmt.Exec(hash, t); err != nil {
+				return err
+			}
+		}
+	}
+
+	_, err = tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?",
+		time.Now().Format(time.RFC3339), hash)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (d *Database) SetTags(hash string, tags []string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM tags WHERE hash = ?", hash); err != nil {
+		return err
+	}
+
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO tags (hash, tag) VALUES (?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	seen := make(map[string]bool)
+	for _, t := range tags {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t != "" && !seen[t] {
+			seen[t] = true
+			if _, err := stmt.Exec(hash, t); err != nil {
+				return err
+			}
+		}
+	}
+
+	_, err = tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?",
+		time.Now().Format(time.RFC3339), hash)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (d *Database) RemoveTags(hash string, tags []string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("DELETE FROM tags WHERE hash = ? AND tag = ?")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, t := range tags {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t != "" {
+			stmt.Exec(hash, t)
+		}
+	}
+
+	_, err = tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?",
+		time.Now().Format(time.RFC3339), hash)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (d *Database) BulkAddTags(hashes []string, tags []string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO tags (hash, tag) VALUES (?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := time.Now().Format(time.RFC3339)
+	updateStmt, err := tx.Prepare("UPDATE videos SET modified_at = ? WHERE hash = ?")
+	if err != nil {
+		return err
+	}
+	defer updateStmt.Close()
+
+	for _, hash := range hashes {
+		for _, t := range tags {
+			t = strings.ToLower(strings.TrimSpace(t))
+			if t != "" {
+				stmt.Exec(hash, t)
+			}
+		}
+		updateStmt.Exec(now, hash)
+	}
+
+	return tx.Commit()
+}
+
+func (d *Database) BulkRemoveTags(hashes []string, tags []string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("DELETE FROM tags WHERE hash = ? AND tag = ?")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := time.Now().Format(time.RFC3339)
+	updateStmt, err := tx.Prepare("UPDATE videos SET modified_at = ? WHERE hash = ?")
+	if err != nil {
+		return err
+	}
+	defer updateStmt.Close()
+
+	for _, hash := range hashes {
+		for _, t := range tags {
+			t = strings.ToLower(strings.TrimSpace(t))
+			if t != "" {
+				stmt.Exec(hash, t)
+			}
+		}
+		updateStmt.Exec(now, hash)
+	}
+
+	return tx.Commit()
+}
+
+func (d *Database) SetMainThumb(hash string, thumbIndex int) error {
+	_, err := d.db.Exec(
+		"UPDATE videos SET main_thumb = ?, modified_at = ? WHERE hash = ?",
+		thumbIndex, time.Now().Format(time.RFC3339), hash,
+	)
+	return err
+}
+
+// === Listing ===
+
+func (d *Database) ListAllVideos() ([]*models.Video, error) {
+	rows, err := d.db.Query(`
+		SELECT hash, path, filename, directory, size, duration, width, height,
+			thumb_count, main_thumb, added_at, modified_at, file_mod_time
+		FROM videos ORDER BY filename
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return d.scanVideosWithTags(rows)
+}
+
+func (d *Database) ListAllTags() ([]models.TagInfo, error) {
+	rows, err := d.db.Query(`
+		SELECT tag, COUNT(*) as cnt
+		FROM tags
+		GROUP BY tag
+		ORDER BY tag
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tags []models.TagInfo
+	for rows.Next() {
+		var t models.TagInfo
+		if err := rows.Scan(&t.Name, &t.Count); err != nil {
+			return nil, err
+		}
+		tags = append(tags, t)
+	}
+	return tags, rows.Err()
+}
+
+// === Export / Import ===
+
+func (d *Database) Export() (*models.ExportData, error) {
+	videos, err := d.ListAllVideos()
+	if err != nil {
+		return nil, err
+	}
+	return &models.ExportData{
+		Version:  1,
+		Exported: time.Now().UTC().Format(time.RFC3339),
+		Videos:   videos,
+	}, nil
+}
+
+func (d *Database) Import(data *models.ExportData) (added, updated, skipped int, err error) {
+	for _, v := range data.Videos {
+		existing, existErr := d.GetVideo(v.Hash)
+		if existErr != nil {
+			// New video
+			if putErr := d.PutVideo(v); putErr != nil {
+				skipped++
+				continue
+			}
+			added++
+		} else {
+			// Merge tags
+			existingTags := make(map[string]bool)
+			for _, t := range existing.Tags {
+				existingTags[t] = true
+			}
+
+			var newTags []string
+			for _, t := range v.Tags {
+				t = strings.ToLower(strings.TrimSpace(t))
+				if t != "" && !existingTags[t] {
+					newTags = append(newTags, t)
+				}
+			}
+
+			changed := false
+			if len(newTags) > 0 {
+				d.AddTags(existing.Hash, newTags)
+				changed = true
+			}
+			if existing.MainThumb <= 0 && v.MainThumb > 0 {
+				d.SetMainThumb(existing.Hash, v.MainThumb)
+				changed = true
+			}
+
+			if changed {
+				updated++
+			} else {
+				skipped++
+			}
+		}
+	}
+	return
+}
+
+// === Helpers ===
+
+func (d *Database) scanVideosWithTags(rows *sql.Rows) ([]*models.Video, error) {
+	var videos []*models.Video
+	for rows.Next() {
+		v := &models.Video{}
+		var addedAt, modifiedAt, fileModTime string
+
+		err := rows.Scan(
+			&v.Hash, &v.Path, &v.Filename, &v.Directory, &v.Size, &v.Duration,
+			&v.Width, &v.Height, &v.ThumbCount, &v.MainThumb,
+			&addedAt, &modifiedAt, &fileModTime,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		v.AddedAt, _ = time.Parse(time.RFC3339, addedAt)
+		v.ModifiedAt, _ = time.Parse(time.RFC3339, modifiedAt)
+		v.FileModTime, _ = time.Parse(time.RFC3339, fileModTime)
+
+		tags, err := d.getVideoTags(v.Hash)
+		if err != nil {
+			return nil, err
+		}
+		v.Tags = tags
+
+		videos = append(videos, v)
+	}
+
+	if videos == nil {
+		videos = []*models.Video{}
+	}
+
+	return videos, rows.Err()
+}
+
+// SearchByTags does a simple AND search for exact tag matches.
+// Kept for backward compatibility with the simple tag filter API.
+func (d *Database) SearchByTags(tags []string) ([]*models.Video, error) {
+	if len(tags) == 0 {
+		return d.ListAllVideos()
+	}
+
+	// Normalize
+	normalized := make([]string, 0, len(tags))
+	for _, t := range tags {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t != "" {
+			normalized = append(normalized, t)
+		}
+	}
+	sort.Strings(normalized)
+
+	// Build intersection query
+	// SELECT hash FROM tags WHERE tag = ? INTERSECT SELECT hash FROM tags WHERE tag = ? ...
+	var parts []string
+	var args []interface{}
+	for _, t := range normalized {
+		parts = append(parts, "SELECT hash FROM tags WHERE tag = ?")
+		args = append(args, t)
+	}
+
+	hashQuery := strings.Join(parts, " INTERSECT ")
+
+	sql := `
+		SELECT v.hash, v.path, v.filename, v.directory, v.size, v.duration,
+			v.width, v.height, v.thumb_count, v.main_thumb,
+			v.added_at, v.modified_at, v.file_mod_time
+		FROM videos v
+		WHERE v.hash IN (` + hashQuery + `)
+		ORDER BY v.filename
+	`
+
+	rows, err := d.db.Query(sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return d.scanVideosWithTags(rows)
+}

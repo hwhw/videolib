@@ -1,0 +1,15 @@
+{{template "header" .}}
+
+<div class="tags-page">
+    <h1>All Tags</h1>
+    <div id="tagList" class="tag-list-page">
+    </div>
+</div>
+
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        loadTagList();
+    });
+</script>
+
+{{template "footer" .}}
