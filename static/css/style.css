@@ -535,3 +535,111 @@ a:hover { color: var(--accent-hover); }
     background: var(--accent) !important;
     color: white !important;
 }
+
+/* Clickable tags */
+.clickable-tag {
+    cursor: pointer;
+}
+
+.clickable-tag:hover {
+    background: var(--accent) !important;
+    color: white !important;
+}
+
+/* Tag links in single-video view */
+.tag-link {
+    color: var(--text);
+    text-decoration: none;
+}
+
+.tag-link:hover {
+    color: var(--accent-hover);
+}
+
+/* Autocomplete dropdown */
+.search-input-wrap,
+.tag-input-wrap,
+.bulk-tag-wrap {
+    position: relative;
+    flex: 1;
+    min-width: 200px;
+}
+
+.search-input-wrap input,
+.tag-input-wrap input,
+.bulk-tag-wrap input {
+    width: 100%;
+    padding: 0.6rem 1rem;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 0.95rem;
+}
+
+.search-input-wrap input:focus,
+.tag-input-wrap input:focus,
+.bulk-tag-wrap input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.tag-input-wrap input {
+    padding: 0.4rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.9rem;
+}
+
+.autocomplete-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-top: none;
+    border-radius: 0 0 6px 6px;
+    z-index: 200;
+    max-height: 250px;
+    overflow-y: auto;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+
+.autocomplete-item {
+    padding: 0.5rem 0.75rem;
+    cursor: pointer;
+    font-size: 0.9rem;
+    color: var(--text);
+}
+
+.autocomplete-item:hover,
+.autocomplete-item.highlighted {
+    background: var(--bg-input);
+    color: var(--accent-hover);
+}
+
+/* Adjust search bar for wrapped input */
+.search-bar {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+/* Bulk bar input wrapper */
+.bulk-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+}
+
+.bulk-bar.hidden {
+    display: none;
+}

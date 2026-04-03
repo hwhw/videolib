@@ -1,9 +1,11 @@
 {{template "header" .}}
 
 <div class="search-bar">
-    <input type="text" id="searchInput"
-           placeholder="Search: filename, tag:value, UNTAGGED, AND/OR/NOT, wildcards*..."
-           autocomplete="off">
+    <div class="search-input-wrap">
+        <input type="text" id="searchInput"
+               placeholder="Search: filename, tag:value, UNTAGGED, AND/OR/NOT, wildcards*..."
+               autocomplete="off">
+    </div>
     <button onclick="doSearch()" class="btn btn-primary">Search</button>
     <button onclick="clearSearch()" class="btn btn-secondary">Clear</button>
     <span id="resultCount" class="result-count"></span>
@@ -30,10 +32,13 @@
 
 <div id="bulkBar" class="bulk-bar hidden">
     <span id="selectedCount">0</span> selected
-    <input type="text" id="bulkTagInput" placeholder="Tags to add/remove (comma separated)...">
+    <div class="bulk-tag-wrap">
+        <input type="text" id="bulkTagInput" placeholder="Tags to add/remove (comma separated)..." autocomplete="off">
+    </div>
     <button onclick="bulkAddTags()" class="btn btn-sm btn-primary">+ Add Tags</button>
     <button onclick="bulkRemoveTags()" class="btn btn-sm btn-danger">- Remove Tags</button>
-    <button onclick="clearSelection()" class="btn btn-sm btn-secondary">Cancel</button>
+    <button onclick="selectAll()" class="btn btn-sm btn-secondary">Select All</button>
+    <button onclick="clearSelection()" class="btn btn-sm btn-secondary">Deselect All</button>
 </div>
 
 <div id="videoGrid" class="video-grid">

@@ -65,7 +65,6 @@ func (d *Database) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_videos_path ON videos(path)`,
 		`CREATE INDEX IF NOT EXISTS idx_videos_directory ON videos(directory)`,
 
-		// FTS5 virtual table for full-text search on filename and path
 		`CREATE VIRTUAL TABLE IF NOT EXISTS videos_fts USING fts5(
 			hash UNINDEXED,
 			filename,
@@ -76,7 +75,6 @@ func (d *Database) migrate() error {
 			tokenize='unicode61 remove_diacritics 2'
 		)`,
 
-		// Triggers to keep FTS in sync
 		`CREATE TRIGGER IF NOT EXISTS videos_ai AFTER INSERT ON videos BEGIN
 			INSERT INTO videos_fts(rowid, hash, filename, path, directory)
 			VALUES (new.rowid, new.hash, new.filename, new.path, new.directory);
@@ -158,6 +156,22 @@ func (d *Database) PutVideo(v *models.Video) error {
 	return tx.Commit()
 }
 
+// UpdateVideoPath changes path/filename/directory for an existing video.
+// Preserves tags, thumbnails, main_thumb, added_at.
+func (d *Database) UpdateVideoPath(v *models.Video, oldPath string) error {
+	_, err := d.db.Exec(`
+		UPDATE videos SET
+			path = ?, filename = ?, directory = ?,
+			size = ?, file_mod_time = ?, modified_at = ?
+		WHERE hash = ?
+	`,
+		v.Path, v.Filename, v.Directory,
+		v.Size, v.FileModTime.Format(time.RFC3339), v.ModifiedAt.Format(time.RFC3339),
+		v.Hash,
+	)
+	return err
+}
+
 func (d *Database) GetVideo(hash string) (*models.Video, error) {
 	v := &models.Video{}
 	var addedAt, modifiedAt, fileModTime string
@@ -192,7 +206,6 @@ func (d *Database) GetVideo(hash string) (*models.Video, error) {
 }
 
 func (d *Database) DeleteVideo(hash string) error {
-	// Tags deleted by CASCADE
 	_, err := d.db.Exec("DELETE FROM videos WHERE hash = ?", hash)
 	return err
 }
@@ -236,10 +249,6 @@ func (d *Database) GetAllHashes() (map[string]bool, error) {
 // === Full-Text Search ===
 
 func (d *Database) FullTextSearch(query string) ([]*models.Video, error) {
-	// Convert user wildcards: * -> FTS5 prefix syntax
-	// "foo*" in FTS5 is written as "foo" with prefix query, or we use the * operator
-	// FTS5 supports: word* for prefix matching
-	// We sanitize the query to be safe for FTS5
 	ftsQuery := sanitizeFTSQuery(query)
 
 	rows, err := d.db.Query(`
@@ -259,8 +268,6 @@ func (d *Database) FullTextSearch(query string) ([]*models.Video, error) {
 	return d.scanVideosWithTags(rows)
 }
 
-// sanitizeFTSQuery converts a user search string into a safe FTS5 query.
-// Supports: word, word*, "exact phrase", and implicit AND between terms.
 func sanitizeFTSQuery(input string) string {
 	input = strings.TrimSpace(input)
 	if input == "" {
@@ -296,7 +303,6 @@ func sanitizeFTSQuery(input string) string {
 		case ch == '*':
 			current.WriteByte('*')
 		default:
-			// Allow alphanumeric, underscore, hyphen, dot
 			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
 				(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' {
 				current.WriteByte(ch)
@@ -307,33 +313,16 @@ func sanitizeFTSQuery(input string) string {
 	if current.Len() > 0 {
 		s := current.String()
 		if inQuote {
-			s += `"` // close unclosed quote
+			s += `"`
 		}
 		parts = append(parts, s)
 	}
 
-	// Join with implicit AND
 	return strings.Join(parts, " AND ")
 }
 
 // === Tag Query Engine ===
 
-// SearchByQuery parses and executes a structured search query.
-// Syntax:
-//   word            - FTS on filename/path (supports word* prefix)
-//   tag:value       - videos with tag exactly matching "value"
-//   tag:val*        - videos with tag matching "val%" (wildcard)
-//   UNTAGGED        - videos with no tags
-//   TAGGED          - videos with at least one tag
-//   AND, OR, NOT    - boolean operators (AND is implicit between terms)
-//   ( )             - grouping
-//
-// Examples:
-//   holiday                       -> FTS for "holiday"
-//   tag:test1                     -> videos tagged "test1"
-//   tag:genre:action              -> videos tagged "genre:action"
-//   tag:act*                      -> videos with tags matching "act%"
-//   (UNTAGGED OR tag:action) AND NOT tag:boring
 func (d *Database) SearchByQuery(query string) ([]*models.Video, error) {
 	tokens := tokenizeQuery(query)
 	if len(tokens) == 0 {
@@ -368,7 +357,7 @@ type tokenType int
 
 const (
 	tokWord   tokenType = iota
-	tokTag              // tag:value
+	tokTag
 	tokAnd
 	tokOr
 	tokNot
@@ -403,7 +392,6 @@ func tokenizeQuery(input string) []token {
 			continue
 		}
 
-		// Read a word (until space or paren)
 		start := i
 		for i < len(input) && input[i] != ' ' && input[i] != '\t' && input[i] != '(' && input[i] != ')' {
 			i++
@@ -420,10 +408,9 @@ func tokenizeQuery(input string) []token {
 		case "NOT":
 			tokens = append(tokens, token{tokNot, "NOT"})
 		default:
-			// Check for tag: prefix (case-insensitive)
 			lower := strings.ToLower(word)
 			if strings.HasPrefix(lower, "tag:") && len(lower) > 4 {
-				tagValue := lower[4:] // everything after "tag:"
+				tagValue := lower[4:]
 				tokens = append(tokens, token{tokTag, tagValue})
 			} else {
 				tokens = append(tokens, token{tokWord, word})
@@ -635,6 +622,7 @@ func (d *Database) AddTags(hash string, tags []string) error {
 
 	for _, t := range tags {
 		t = strings.ToLower(strings.TrimSpace(t))
+		t = strings.ReplaceAll(t, " ", "")
 		if t != "" {
 			if _, err := stmt.Exec(hash, t); err != nil {
 				return err
@@ -671,6 +659,7 @@ func (d *Database) SetTags(hash string, tags []string) error {
 	seen := make(map[string]bool)
 	for _, t := range tags {
 		t = strings.ToLower(strings.TrimSpace(t))
+		t = strings.ReplaceAll(t, " ", "")
 		if t != "" && !seen[t] {
 			seen[t] = true
 			if _, err := stmt.Exec(hash, t); err != nil {
@@ -703,6 +692,7 @@ func (d *Database) RemoveTags(hash string, tags []string) error {
 
 	for _, t := range tags {
 		t = strings.ToLower(strings.TrimSpace(t))
+		t = strings.ReplaceAll(t, " ", "")
 		if t != "" {
 			stmt.Exec(hash, t)
 		}
@@ -740,6 +730,7 @@ func (d *Database) BulkAddTags(hashes []string, tags []string) error {
 	for _, hash := range hashes {
 		for _, t := range tags {
 			t = strings.ToLower(strings.TrimSpace(t))
+			t = strings.ReplaceAll(t, " ", "")
 			if t != "" {
 				stmt.Exec(hash, t)
 			}
@@ -773,6 +764,7 @@ func (d *Database) BulkRemoveTags(hashes []string, tags []string) error {
 	for _, hash := range hashes {
 		for _, t := range tags {
 			t = strings.ToLower(strings.TrimSpace(t))
+			t = strings.ReplaceAll(t, " ", "")
 			if t != "" {
 				stmt.Exec(hash, t)
 			}
@@ -848,14 +840,12 @@ func (d *Database) Import(data *models.ExportData) (added, updated, skipped int,
 	for _, v := range data.Videos {
 		existing, existErr := d.GetVideo(v.Hash)
 		if existErr != nil {
-			// New video
 			if putErr := d.PutVideo(v); putErr != nil {
 				skipped++
 				continue
 			}
 			added++
 		} else {
-			// Merge tags
 			existingTags := make(map[string]bool)
 			for _, t := range existing.Tags {
 				existingTags[t] = true
@@ -926,14 +916,11 @@ func (d *Database) scanVideosWithTags(rows *sql.Rows) ([]*models.Video, error) {
 	return videos, rows.Err()
 }
 
-// SearchByTags does a simple AND search for exact tag matches.
-// Kept for backward compatibility with the simple tag filter API.
 func (d *Database) SearchByTags(tags []string) ([]*models.Video, error) {
 	if len(tags) == 0 {
 		return d.ListAllVideos()
 	}
 
-	// Normalize
 	normalized := make([]string, 0, len(tags))
 	for _, t := range tags {
 		t = strings.ToLower(strings.TrimSpace(t))
@@ -943,8 +930,6 @@ func (d *Database) SearchByTags(tags []string) ([]*models.Video, error) {
 	}
 	sort.Strings(normalized)
 
-	// Build intersection query
-	// SELECT hash FROM tags WHERE tag = ? INTERSECT SELECT hash FROM tags WHERE tag = ? ...
 	var parts []string
 	var args []interface{}
 	for _, t := range normalized {
@@ -954,7 +939,7 @@ func (d *Database) SearchByTags(tags []string) ([]*models.Video, error) {
 
 	hashQuery := strings.Join(parts, " INTERSECT ")
 
-	sql := `
+	sqlStr := `
 		SELECT v.hash, v.path, v.filename, v.directory, v.size, v.duration,
 			v.width, v.height, v.thumb_count, v.main_thumb,
 			v.added_at, v.modified_at, v.file_mod_time
@@ -963,7 +948,7 @@ func (d *Database) SearchByTags(tags []string) ([]*models.Video, error) {
 		ORDER BY v.filename
 	`
 
-	rows, err := d.db.Query(sql, args...)
+	rows, err := d.db.Query(sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}

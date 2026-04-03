@@ -3,6 +3,7 @@ var allVideos = [];
 var selectedHashes = new Set();
 var thumbCache = {};
 var thumbIntervals = {};
+var allTagNames = []; // cached tag list for autocomplete
 
 // === API Helpers ===
 function api(url, options) {
@@ -18,7 +19,213 @@ function api(url, options) {
         });
 }
 
-// === Search: always use the query engine ===
+// Load all tag names once for autocomplete
+function loadAllTagNames() {
+    return api('/api/tags').then(function(tags) {
+        allTagNames = (tags || []).map(function(t) { return t.name; });
+        return allTagNames;
+    }).catch(function() {
+        allTagNames = [];
+        return [];
+    });
+}
+
+// === Autocomplete Engine ===
+function setupAutocomplete(input, options) {
+    options = options || {};
+    // mode: 'tag' (comma-separated tags), 'search' (tag: prefix in search)
+    var mode = options.mode || 'tag';
+    var onSelect = options.onSelect || null;
+
+    var container = document.createElement('div');
+    container.className = 'autocomplete-dropdown';
+    container.style.display = 'none';
+    input.parentNode.style.position = 'relative';
+    input.parentNode.appendChild(container);
+
+    var selectedIdx = -1;
+    var currentMatches = [];
+
+    function getEditingToken() {
+        var val = input.value;
+        var cursor = input.selectionStart || val.length;
+
+        if (mode === 'search') {
+            // Find if cursor is inside a tag: token
+            // Walk backward from cursor to find start of current token
+            var before = val.substring(0, cursor);
+            // Find last tag: occurrence before cursor
+            var match = before.match(/(?:^|\s)(tag:)([^\s]*)$/i);
+            if (match) {
+                var prefix = match[2];
+                var start = before.length - match[2].length;
+                return { prefix: prefix, start: start, end: cursor, isTag: true };
+            }
+            return null;
+        } else {
+            // Comma-separated tag mode
+            // Find which comma-segment the cursor is in
+            var segments = [];
+            var pos = 0;
+            var parts = val.split(',');
+            for (var i = 0; i < parts.length; i++) {
+                var segStart = pos;
+                var segEnd = pos + parts[i].length;
+                segments.push({ text: parts[i], start: segStart, end: segEnd });
+                pos = segEnd + 1; // skip comma
+            }
+
+            for (var j = 0; j < segments.length; j++) {
+                if (cursor >= segments[j].start && cursor <= segments[j].end) {
+                    var text = segments[j].text.trim();
+                    // Adjust start to skip leading whitespace
+                    var trimStart = segments[j].start + (segments[j].text.length - segments[j].text.trimStart().length);
+                    return { prefix: text, start: trimStart, end: segments[j].end, isTag: false };
+                }
+            }
+            return null;
+        }
+    }
+
+    function showMatches(token) {
+        if (!token || token.prefix.length === 0) {
+            hide();
+            return;
+        }
+
+        var prefix = token.prefix.toLowerCase();
+        currentMatches = allTagNames.filter(function(t) {
+            return t.toLowerCase().indexOf(prefix) === 0 && t.toLowerCase() !== prefix;
+        }).slice(0, 10);
+
+        if (currentMatches.length === 0) {
+            hide();
+            return;
+        }
+
+        selectedIdx = -1;
+        container.innerHTML = '';
+        currentMatches.forEach(function(tag, idx) {
+            var item = document.createElement('div');
+            item.className = 'autocomplete-item';
+            item.textContent = tag;
+            item.addEventListener('mousedown', function(e) {
+                e.preventDefault(); // Don't blur input
+                pickMatch(token, idx);
+            });
+            container.appendChild(item);
+        });
+        container.style.display = 'block';
+    }
+
+    function pickMatch(token, idx) {
+        var tag = currentMatches[idx];
+        if (!tag) return;
+
+        var val = input.value;
+
+        if (mode === 'search') {
+            // Replace just the part after tag:
+            var before = val.substring(0, token.start);
+            var after = val.substring(token.end);
+            input.value = before + tag + after;
+            var newCursor = token.start + tag.length;
+            input.setSelectionRange(newCursor, newCursor);
+        } else {
+            // Replace current comma segment
+            var before = val.substring(0, token.start);
+            var after = val.substring(token.end);
+            // Add comma+space after if there's more content or add one for next tag
+            var suffix = after.length > 0 ? '' : ', ';
+            input.value = before + tag + suffix + after.trimStart();
+            var newCursor = token.start + tag.length + suffix.length;
+            input.setSelectionRange(newCursor, newCursor);
+        }
+
+        hide();
+        input.focus();
+
+        if (onSelect) onSelect(tag);
+    }
+
+    function hide() {
+        container.style.display = 'none';
+        currentMatches = [];
+        selectedIdx = -1;
+    }
+
+    function highlightItem(idx) {
+        var items = container.querySelectorAll('.autocomplete-item');
+        items.forEach(function(item, i) {
+            if (i === idx) {
+                item.classList.add('highlighted');
+            } else {
+                item.classList.remove('highlighted');
+            }
+        });
+    }
+
+    input.addEventListener('input', function() {
+        var token = getEditingToken();
+        showMatches(token);
+    });
+
+    input.addEventListener('keydown', function(e) {
+        if (container.style.display === 'none') return;
+
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            selectedIdx = Math.min(selectedIdx + 1, currentMatches.length - 1);
+            highlightItem(selectedIdx);
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            selectedIdx = Math.max(selectedIdx - 1, 0);
+            highlightItem(selectedIdx);
+        } else if (e.key === 'Enter' && selectedIdx >= 0) {
+            e.preventDefault();
+            var token = getEditingToken();
+            if (token) pickMatch(token, selectedIdx);
+        } else if (e.key === 'Escape') {
+            hide();
+        } else if (e.key === 'Tab' && selectedIdx >= 0) {
+            e.preventDefault();
+            var token = getEditingToken();
+            if (token) pickMatch(token, selectedIdx);
+        }
+    });
+
+    input.addEventListener('blur', function() {
+        // Delay to allow mousedown on items
+        setTimeout(hide, 150);
+    });
+
+    return { hide: hide };
+}
+
+// Strip spaces from pasted/typed tags
+function sanitizeTagInput(input) {
+    input.addEventListener('input', function() {
+        // Replace spaces within tag segments (between commas) with nothing
+        var val = input.value;
+        var parts = val.split(',');
+        var cleaned = parts.map(function(p) {
+            // Preserve a trailing space after comma for readability
+            return p.replace(/\s+/g, '');
+        });
+        var newVal = cleaned.join(', ');
+        if (newVal !== val) {
+            var cursor = input.selectionStart;
+            input.value = newVal;
+            // Try to keep cursor roughly in place
+            input.setSelectionRange(
+                Math.min(cursor, newVal.length),
+                Math.min(cursor, newVal.length)
+            );
+        }
+    });
+}
+
+// === Search ===
 function doSearch() {
     var searchInput = document.getElementById('searchInput');
     var val = searchInput ? searchInput.value.trim() : '';
@@ -28,15 +235,13 @@ function doSearch() {
         return;
     }
 
-    // Always use the search query engine
     loadVideos(val);
 }
 
 function searchForTag(tag) {
-    var searchInput = document.getElementById('searchInput');
     var query = 'tag:' + tag;
-    if (searchInput) searchInput.value = query;
-    loadVideos(query);
+    // Navigate to index with search param
+    window.location.href = '/?search=' + encodeURIComponent(query);
 }
 
 function clearSearch() {
@@ -125,14 +330,12 @@ function renderVideoGrid(videos) {
                 tagsHtml +
             '</div>';
 
-        // Checkbox
         var checkbox = card.querySelector('.select-checkbox');
         checkbox.addEventListener('click', function(e) {
             e.stopPropagation();
             toggleSelect(v.hash);
         });
 
-        // Thumbnail hover
         var thumbContainer = card.querySelector('.thumb-container');
         thumbContainer.addEventListener('mouseenter', function() {
             startThumbCycle(v.hash);
@@ -144,8 +347,6 @@ function renderVideoGrid(videos) {
             window.location.href = '/video/' + v.hash;
         });
 
-        // Card body click -> navigate (but not on tags)
-        var cardBody = card.querySelector('.card-body');
         var cardTitle = card.querySelector('.card-title');
         var cardMeta = card.querySelector('.card-meta');
         if (cardTitle) {
@@ -159,7 +360,6 @@ function renderVideoGrid(videos) {
             });
         }
 
-        // Clickable tags in card
         var tagElements = card.querySelectorAll('.clickable-tag');
         tagElements.forEach(function(el) {
             el.addEventListener('click', function(e) {
@@ -225,6 +425,21 @@ function toggleSelect(hash) {
     updateBulkBar();
 }
 
+function selectAll() {
+    allVideos.forEach(function(v) {
+        if (!selectedHashes.has(v.hash)) {
+            selectedHashes.add(v.hash);
+            var card = document.getElementById('card-' + v.hash);
+            if (card) {
+                card.classList.add('selected');
+                var cb = card.querySelector('.select-checkbox');
+                if (cb) cb.checked = true;
+            }
+        }
+    });
+    updateBulkBar();
+}
+
 function updateBulkBar() {
     var bar = document.getElementById('bulkBar');
     var count = document.getElementById('selectedCount');
@@ -254,7 +469,7 @@ function clearSelection() {
 function bulkAddTags() {
     var input = document.getElementById('bulkTagInput');
     if (!input) return;
-    var tags = input.value.split(',').map(function(t) { return t.trim(); }).filter(function(t) { return t; });
+    var tags = input.value.split(',').map(function(t) { return t.trim().replace(/\s+/g, ''); }).filter(function(t) { return t; });
     if (tags.length === 0 || selectedHashes.size === 0) return;
 
     api('/api/bulk/tags', {
@@ -267,6 +482,7 @@ function bulkAddTags() {
     }).then(function() {
         input.value = '';
         clearSelection();
+        loadAllTagNames(); // refresh autocomplete cache
         doSearch();
     }).catch(function(err) {
         alert('Error: ' + err.message);
@@ -276,7 +492,7 @@ function bulkAddTags() {
 function bulkRemoveTags() {
     var input = document.getElementById('bulkTagInput');
     if (!input) return;
-    var tags = input.value.split(',').map(function(t) { return t.trim(); }).filter(function(t) { return t; });
+    var tags = input.value.split(',').map(function(t) { return t.trim().replace(/\s+/g, ''); }).filter(function(t) { return t; });
     if (tags.length === 0 || selectedHashes.size === 0) return;
 
     api('/api/bulk/tags', {
@@ -289,6 +505,7 @@ function bulkRemoveTags() {
     }).then(function() {
         input.value = '';
         clearSelection();
+        loadAllTagNames();
         doSearch();
     }).catch(function(err) {
         alert('Error: ' + err.message);
@@ -301,7 +518,7 @@ function addTagsToVideo() {
     var input = document.getElementById('newTagInput');
     if (!input) return;
 
-    var tags = input.value.split(',').map(function(t) { return t.trim(); }).filter(function(t) { return t; });
+    var tags = input.value.split(',').map(function(t) { return t.trim().replace(/\s+/g, ''); }).filter(function(t) { return t; });
     if (tags.length === 0) return;
 
     api('/api/videos/' + currentHash + '/tags', {
@@ -310,6 +527,7 @@ function addTagsToVideo() {
     }).then(function(video) {
         input.value = '';
         renderTagContainer(video.tags || []);
+        loadAllTagNames(); // refresh cache
     }).catch(function(err) {
         alert('Error: ' + err.message);
     });
@@ -321,6 +539,7 @@ function removeTag(hash, tag) {
         body: JSON.stringify({ tags: [tag] })
     }).then(function(video) {
         renderTagContainer(video.tags || []);
+        loadAllTagNames();
     }).catch(function(err) {
         alert('Error: ' + err.message);
     });
@@ -333,28 +552,28 @@ function renderTagContainer(tags) {
     container.innerHTML = '';
     tags.forEach(function(t) {
         var span = document.createElement('span');
-        span.className = 'tag clickable-tag';
+        span.className = 'tag';
         span.dataset.tag = t;
 
-        var text = document.createTextNode(t + ' ');
-        span.appendChild(text);
+        var link = document.createElement('a');
+        link.className = 'tag-link';
+        link.href = '/?search=' + encodeURIComponent('tag:' + t);
+        link.textContent = t;
+        link.addEventListener('click', function(e) {
+            e.stopPropagation();
+        });
 
         var btn = document.createElement('button');
         btn.className = 'tag-remove';
         btn.innerHTML = '&times;';
         btn.addEventListener('click', function(e) {
+            e.preventDefault();
             e.stopPropagation();
             removeTag(currentHash, t);
         });
 
+        span.appendChild(link);
         span.appendChild(btn);
-
-        // Click tag to search for it
-        span.addEventListener('click', function(e) {
-            if (e.target === btn) return;
-            window.location.href = '/?search=' + encodeURIComponent('tag:' + t);
-        });
-
         container.appendChild(span);
     });
 
@@ -433,7 +652,6 @@ function loadSimilarVideos(hash, tags) {
 
     grid.innerHTML = '<div class="loading">Finding similar</div>';
 
-    // Build OR query for all current tags
     var query = tags.map(function(t) {
         return 'tag:' + t;
     }).join(' OR ');
@@ -544,6 +762,36 @@ function escapeHtml(str) {
 
 // === Init ===
 document.addEventListener('DOMContentLoaded', function() {
+    // Load tag names for autocomplete
+    loadAllTagNames().then(function() {
+        // Setup autocomplete on search input
+        var searchInput = document.getElementById('searchInput');
+        if (searchInput) {
+            setupAutocomplete(searchInput, { mode: 'search' });
+            searchInput.addEventListener('keyup', function(e) {
+                if (e.key === 'Enter') doSearch();
+            });
+        }
+
+        // Setup autocomplete on bulk tag input
+        var bulkInput = document.getElementById('bulkTagInput');
+        if (bulkInput) {
+            setupAutocomplete(bulkInput, { mode: 'tag' });
+            sanitizeTagInput(bulkInput);
+        }
+
+        // Setup autocomplete on single-video tag input
+        var newTagInput = document.getElementById('newTagInput');
+        if (newTagInput) {
+            setupAutocomplete(newTagInput, { mode: 'tag' });
+            sanitizeTagInput(newTagInput);
+            newTagInput.addEventListener('keyup', function(e) {
+                if (e.key === 'Enter') addTagsToVideo();
+            });
+        }
+    });
+
+    // Load videos on index page
     if (window.location.pathname === '/') {
         var params = new URLSearchParams(window.location.search);
         var searchParam = params.get('search');
@@ -556,12 +804,5 @@ document.addEventListener('DOMContentLoaded', function() {
         } else {
             loadVideos();
         }
-    }
-
-    var searchInput = document.getElementById('searchInput');
-    if (searchInput) {
-        searchInput.addEventListener('keyup', function(e) {
-            if (e.key === 'Enter') doSearch();
-        });
     }
 });

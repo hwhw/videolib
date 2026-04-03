@@ -44,14 +44,15 @@
                 {{$hash := .Hash}}
                 {{range .Tags}}
                 <span class="tag" data-tag="{{.}}">
-                    {{.}}
-                    <button class="tag-remove" onclick="removeTag('{{$hash}}', '{{.}}')">&times;</button>
+                    <a class="tag-link" href="/?search={{urlquery (print "tag:" .)}}" onclick="event.stopPropagation()">{{.}}</a>
+                    <button class="tag-remove" onclick="event.preventDefault();event.stopPropagation();removeTag('{{$hash}}', '{{.}}')">&times;</button>
                 </span>
                 {{end}}
             </div>
             <div class="tag-input-row">
-                <input type="text" id="newTagInput" placeholder="Add tags (comma separated)..."
-                       onkeyup="if(event.key==='Enter')addTagsToVideo()">
+                <div class="tag-input-wrap">
+                    <input type="text" id="newTagInput" placeholder="Add tags (comma separated)..." autocomplete="off">
+                </div>
                 <button onclick="addTagsToVideo()" class="btn btn-primary btn-sm">Add Tags</button>
             </div>
         </div>

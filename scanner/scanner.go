@@ -29,11 +29,13 @@ type Scanner struct {
 	roots      []string
 	thumbDir   string
 	thumbCount int
+	fileFilter string
 }
 
 type ScanResult struct {
 	Added   int
-	Removed int
+	Updated int
+	Skipped int
 	Errors  int
 	Total   int
 }
@@ -47,10 +49,28 @@ func New(database *db.Database, roots []string, thumbDir string) *Scanner {
 	}
 }
 
+func (s *Scanner) SetFileFilter(filename string) {
+	s.fileFilter = filename
+}
+
+func (s *Scanner) isVideoFile(path string, info os.FileInfo) bool {
+	if info.IsDir() {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	if !videoExtensions[ext] {
+		return false
+	}
+	if s.fileFilter != "" && filepath.Base(path) != s.fileFilter {
+		return false
+	}
+	return true
+}
+
 func (s *Scanner) Scan() (*ScanResult, error) {
 	result := &ScanResult{}
 
-	log.Println("Scanning directories for video files...")
+	log.Println("Scanning for video files...")
 	diskFiles := make(map[string]os.FileInfo)
 	for _, root := range s.roots {
 		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -58,12 +78,7 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 				log.Printf("Warning: cannot access %s: %v", path, err)
 				return nil
 			}
-			if info.IsDir() {
-				return nil
-			}
-			ext := strings.ToLower(filepath.Ext(path))
-			if videoExtensions[ext] {
-				// Keep as relative path (clean it)
+			if s.isVideoFile(path, info) {
 				cleanPath := filepath.Clean(path)
 				diskFiles[cleanPath] = info
 			}
@@ -76,25 +91,12 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 	log.Printf("Found %d video files on disk", len(diskFiles))
 	result.Total = len(diskFiles)
 
+	// Get existing paths to detect already-known files
 	existingPaths, err := s.database.GetAllPaths()
 	if err != nil {
 		return nil, fmt.Errorf("reading existing paths: %w", err)
 	}
 
-	// Find deleted files
-	for path, hash := range existingPaths {
-		if _, exists := diskFiles[path]; !exists {
-			log.Printf("Removing deleted file: %s", path)
-			if err := s.database.DeleteVideo(hash); err != nil {
-				log.Printf("Error removing %s: %v", path, err)
-				result.Errors++
-			} else {
-				result.Removed++
-			}
-		}
-	}
-
-	// Find new files
 	type workItem struct {
 		path string
 		info os.FileInfo
@@ -104,15 +106,47 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 	for path, info := range diskFiles {
 		if _, exists := existingPaths[path]; !exists {
 			items = append(items, workItem{path, info})
+		} else {
+			result.Skipped++
 		}
 	}
 
-	log.Printf("Processing %d new files...", len(items))
+	log.Printf("Processing %d new files (%d already known)...", len(items), result.Skipped)
 
 	for i, item := range items {
 		log.Printf("[%d/%d] Processing: %s", i+1, len(items), item.path)
 
-		video, err := s.processFile(item.path, item.info)
+		hash, err := hasher.HashFile(item.path)
+		if err != nil {
+			log.Printf("Error hashing %s: %v", item.path, err)
+			result.Errors++
+			continue
+		}
+
+		// Check if this hash already exists (file was renamed/moved)
+		existing, existErr := s.database.GetVideo(hash)
+		if existErr == nil {
+			// Hash known — update path, keep tags/thumbs/main_thumb
+			oldPath := existing.Path
+			existing.Path = filepath.Clean(item.path)
+			existing.Filename = filepath.Base(item.path)
+			existing.Directory = filepath.Dir(item.path)
+			existing.Size = item.info.Size()
+			existing.FileModTime = item.info.ModTime()
+			existing.ModifiedAt = time.Now()
+
+			if err := s.database.UpdateVideoPath(existing, oldPath); err != nil {
+				log.Printf("Error updating path for %s: %v", item.path, err)
+				result.Errors++
+			} else {
+				log.Printf("Updated path: %s -> %s (hash %s)", oldPath, item.path, hash[:12])
+				result.Updated++
+			}
+			continue
+		}
+
+		// Truly new file
+		video, err := s.buildVideo(hash, item.path, item.info)
 		if err != nil {
 			log.Printf("Error processing %s: %v", item.path, err)
 			result.Errors++
@@ -135,15 +169,10 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 	return result, nil
 }
 
-func (s *Scanner) processFile(path string, info os.FileInfo) (*models.Video, error) {
-	hash, err := hasher.HashFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("hashing: %w", err)
-	}
-
+func (s *Scanner) buildVideo(hash, path string, info os.FileInfo) (*models.Video, error) {
 	duration, width, height := s.probeVideo(path)
 
-	video := &models.Video{
+	return &models.Video{
 		Hash:        hash,
 		Path:        filepath.Clean(path),
 		Filename:    filepath.Base(path),
@@ -158,9 +187,7 @@ func (s *Scanner) processFile(path string, info os.FileInfo) (*models.Video, err
 		AddedAt:     time.Now(),
 		ModifiedAt:  time.Now(),
 		FileModTime: info.ModTime(),
-	}
-
-	return video, nil
+	}, nil
 }
 
 type ffprobeResult struct {
@@ -238,7 +265,7 @@ func (s *Scanner) generateThumbnails(video *models.Video) error {
 			"-y",
 			outPath,
 		)
-		cmd.Run() // best effort
+		cmd.Run()
 	}
 
 	entries, _ := os.ReadDir(thumbDir)
@@ -253,7 +280,6 @@ func (s *Scanner) generateThumbnails(video *models.Video) error {
 	return s.database.PutVideo(video)
 }
 
-// ScrubThumbnails removes thumbnail directories for videos not in the database
 func (s *Scanner) ScrubThumbnails() (removed int, err error) {
 	knownHashes, err := s.database.GetAllHashes()
 	if err != nil {
