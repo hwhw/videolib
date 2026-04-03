@@ -1,3 +1,6 @@
+## README.md
+
+```markdown
 # videolib
 
 A self-contained video library server with tagging, search, and thumbnail previews. Scans directories for video files, extracts metadata via ffprobe, generates thumbnail strips, and serves a responsive web UI for browsing, searching, and tagging your collection. All data is stored in a local SQLite database. The entire application — including HTML templates, CSS, and JavaScript — compiles into a single binary.
@@ -40,7 +43,7 @@ The resulting binary is fully self-contained — all static assets are embedded.
 Since the SQLite driver uses CGO, cross-compilation requires a C cross-compiler:
 
 ```bash
-CC=x86_64-linux-musl-gcc GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -o videolib .
+CC=x86_64-linux-musl-gcc GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -tags fts5 -o videolib .
 ```
 
 ## Web Frontend
@@ -53,10 +56,11 @@ The main page displays videos in a card grid that adapts to screen size. Each ca
 
 - A thumbnail image (the selected main thumbnail or the first generated one)
 - Video duration badge
-- Filename and directory path
+- Title (or filename if no title is set)
+- Directory path
 - Up to 5 tag pills
 
-**Thumbnail preview**: Hovering over a card (desktop) or tapping it (mobile) cycles through all generated thumbnails for that video, giving a quick preview without opening the player. The cycle runs once through all thumbnails and stops. On mobile, a second tap navigates to the video page.
+**Thumbnail preview**: Hovering over a card (desktop) or tapping it (mobile) cycles through all generated thumbnails for that video once, then stops. On desktop, moving the mouse away resets to the main thumbnail immediately. On mobile, a second tap navigates to the video page.
 
 **Tag navigation**: Clicking any tag pill in the grid navigates to a search for that tag.
 
@@ -66,9 +70,9 @@ A single unified search bar supports a rich query language:
 
 | Query | Meaning |
 |-------|---------|
-| `holiday` | Full-text search in filenames and paths |
+| `holiday` | Full-text search in filenames, paths, and titles |
 | `holiday*` | Prefix/truncated search |
-| `"beach party"` | Exact phrase match in filenames/paths |
+| `"beach party"` | Exact phrase match |
 | `tag:action` | Videos with the tag "action" |
 | `tag:genre*` | Videos with tags matching "genre..." |
 | `UNTAGGED` | Videos with no tags at all |
@@ -78,7 +82,8 @@ A single unified search bar supports a rich query language:
 | `duration:+1:00:00` | Videos 1 hour or longer |
 | `size:+100m` | Videos 100 MiB or larger |
 | `size:-1g` | Videos smaller than 1 GiB |
-| `path:videos/2024/*` | Path matching shell glob (case-sensitive) |
+| `size:+500k` | Videos 500 KiB or larger |
+| `path:videos/2024/*` | Path matching shell glob (case-sensitive, `*`, `?`, `[abc]`) |
 | `path:"my videos/*.mp4"` | Quoted glob with spaces |
 | `ipath:*.mkv` | Case-insensitive path glob |
 | `A AND B` | Both conditions must match |
@@ -87,7 +92,7 @@ A single unified search bar supports a rich query language:
 | `(A OR B) AND NOT C` | Grouping with parentheses |
 | `holiday tag:vacation` | Implicit AND between terms |
 
-Duration values accept `SS`, `MM:SS`, or `HH:MM:SS` formats. Size values accept a number with optional `k`, `m`, or `g` suffix (binary KiB/MiB/GiB).
+Duration values accept `SS`, `MM:SS`, or `HH:MM:SS` formats. Size values accept a number with optional `k`, `m`, or `g` suffix (binary KiB/MiB/GiB). Path globs use shell-style rules: `*` matches any characters, `?` matches a single character, `[abc]` matches a character class.
 
 The search bar features **tag autocomplete** — typing `tag:` followed by characters shows a dropdown of matching existing tags, navigable with arrow keys and Tab/Enter.
 
@@ -95,7 +100,7 @@ The search bar features **tag autocomplete** — typing `tag:` followed by chara
 
 Search results can be sorted by:
 
-- **Name** — filename (default)
+- **Name** — title if set, otherwise filename (default)
 - **Path** — full relative path including filename
 - **Hash** — content hash (quasi-random but stable ordering)
 - **Added** — date the video was first scanned
@@ -115,6 +120,8 @@ Selecting one or more videos (via checkboxes) reveals a bulk action bar:
 
 This enables fast workflows like: search for `UNTAGGED`, select all, add initial tags.
 
+Tags may not contain spaces — any spaces entered are stripped automatically.
+
 ### Single Video View
 
 Clicking a video opens the player page with:
@@ -122,12 +129,26 @@ Clicking a video opens the player page with:
 - **HTML5 video player** with poster image (selected thumbnail shown before playback starts)
 - **Download button** to open the video file in an external player or save it locally
 - **Thumbnail picker** — opens a grid of all generated thumbnails; click one to set it as the main thumbnail used in the grid view and as the player poster
+- **Title** — displayed prominently; when a title is set, the original filename is shown as a smaller hint below. Click the edit button to set or change the title.
+- **Description** — displayed below the title, rendered from Markdown. Supports headings, bold, italic, inline code, code blocks, lists, and links. Click the edit button to modify.
 - **Tag editor** — view, add, and remove tags; each tag is a clickable link that searches for other videos with the same tag
 - **Similar videos** — automatically shown based on shared tags, ranked by number of tags in common
 
 ### Tags Page
 
 A dedicated page lists all tags with usage counts. Clicking a tag navigates to the search results for that tag.
+
+### Read-Only Mode
+
+Starting the server with `-readonly` disables all editing in the web interface:
+
+- Tag add/remove buttons and bulk tagging are hidden
+- Title and description edit buttons are hidden
+- Thumbnail picker is hidden
+- All write API endpoints return 403 Forbidden
+- A "Read-Only" badge appears in the navigation bar
+
+This is useful for sharing the library with others without allowing modifications.
 
 ## Command Line
 
@@ -149,6 +170,7 @@ Starts the HTTP server. Video file paths are read from the database, so no direc
 | `-thumbs` | `thumbnails` | Thumbnail directory |
 | `-addr` | `:8080` | Listen address |
 | `-title` | `Video Library` | Web application title shown in the navbar and browser tab |
+| `-readonly` | `false` | Read-only mode — disables all editing |
 
 **Examples:**
 
@@ -158,6 +180,9 @@ videolib serve
 
 # Custom port and title
 videolib serve -addr :9090 -title "My Movies"
+
+# Read-only sharing
+videolib serve -readonly -title "Movie Archive"
 
 # Use a specific database
 videolib serve -db /data/videos.db -thumbs /data/thumbs
@@ -173,9 +198,9 @@ Each path can be:
 
 - **A directory** — scanned recursively for video files
 - **A single video file** — added directly
-- **A JSON file** — previously exported with `videolib list -format json`, imported with tag merging
+- **A JSON file** — previously exported with `videolib list -format json`, imported with tag, title, and description merging
 
-When scanning encounters a file whose content hash already exists in the database (e.g., a renamed or moved file), the database entry is updated to the new path while **preserving all tags, thumbnails, and the selected main thumbnail**.
+When scanning encounters a file whose content hash already exists in the database (e.g., a renamed or moved file), the database entry is updated to the new path while **preserving all tags, thumbnails, title, description, and the selected main thumbnail**.
 
 Scanning does **not** remove entries for files that no longer exist — use `videolib scrub` for that.
 
@@ -200,7 +225,7 @@ videolib scan ./movies ./series ./downloads
 # Scan a single file
 videolib scan ./new-video.mp4
 
-# Import a previously exported JSON
+# Import a previously exported JSON (includes tags, titles, descriptions)
 videolib scan backup.json
 
 # Mix directories, files, and imports
@@ -268,9 +293,9 @@ Outputs video data in two formats. The optional search query uses the same synta
 HASH<tab>TAGS<tab>PATH
 ```
 
-Tags are comma-separated with no spaces. Videos with no tags show `-`.
+Tags are comma-separated with no spaces. Videos with no tags show `-`. The text format always shows the file path (not the title) for scripting compatibility.
 
-**JSON format** outputs a full export that can be re-imported with `videolib scan`.
+**JSON format** outputs a full export including tags, titles, and descriptions. This can be re-imported with `videolib scan`.
 
 **Examples:**
 
@@ -283,8 +308,9 @@ videolib list tag:action
 videolib list UNTAGGED
 videolib list "duration:+1:00:00 AND size:+1g"
 videolib list 'ipath:*/comedy/*'
+videolib list '"beach party"'
 
-# Export to JSON (importable backup)
+# Export to JSON (importable backup with titles and descriptions)
 videolib list -format json -output backup.json
 
 # Export search results
@@ -342,13 +368,76 @@ videolib list 'duration:-60' | videolib tags -add short
 videolib list 'size:+2g' | videolib tags -add large-file
 ```
 
+### `title` — Set video title
+
+```
+videolib title [options] <hash> [title text]
+```
+
+Sets or clears the title of a video. When a title is set, it is displayed instead of the filename in the web frontend. Full-text search also matches against titles.
+
+If no title text is given and `-file` is not specified, the title is cleared.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-db` | `videolib.db` | Database file path |
+| `-file` | *(none)* | Read title from a file |
+
+**Examples:**
+
+```bash
+# Set a title
+videolib title abc123de "My Vacation Video"
+
+# Set title from a file
+videolib title -file title.txt abc123de
+
+# Clear a title (reverts to showing filename)
+videolib title abc123de
+
+# Use hash prefix
+videolib title abc123 "Short Title"
+```
+
+### `description` — Set video description
+
+```
+videolib description [options] <hash> [description text]
+```
+
+Sets or clears the description of a video. Descriptions are rendered as Markdown in the web frontend, supporting headings, bold, italic, code, lists, and links. For multi-line content, use `-file`.
+
+If no text is given and `-file` is not specified, the description is cleared.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-db` | `videolib.db` | Database file path |
+| `-file` | *(none)* | Read description from a file (supports Markdown) |
+
+**Examples:**
+
+```bash
+# Set a simple description
+videolib description abc123de "A fun day at the beach"
+
+# Set description from a markdown file
+videolib description -file notes.md abc123de
+
+# Clear a description
+videolib description abc123de
+
+# Pipe content
+echo "# Chapter 1\nThe adventure begins..." > desc.md
+videolib description -file desc.md abc123de
+```
+
 ### `hash` — Compute file content hashes
 
 ```
 videolib hash [<file> ...]
 ```
 
-Computes the same content hash used internally to identify videos. If no filenames are given, reads filenames from stdin (one per line). Outputs one hash per line. Prints `NOTFOUND` for files that don't exist.
+Computes the same content hash used internally to identify videos (SHA-256 of the first 10 MB plus file size). If no filenames are given, reads filenames from stdin (one per line). Outputs one hash per line. Prints `NOTFOUND` for files that don't exist or can't be read.
 
 **Examples:**
 
@@ -393,7 +482,7 @@ videolib scan ./downloads
 # Clean up after deleting files
 videolib scrub
 
-# Backup your tags and metadata
+# Backup your tags, titles, and descriptions
 videolib list -format json -output backup.json
 
 # Restore on another machine
@@ -408,19 +497,65 @@ videolib scan /path/to/same/videos
 videolib list 'ipath:videos/action/*' | videolib tags -add genre:action
 
 # Find and tag unreviewed content
-videolib list 'UNTAGGED' | videolib tags -add needs-review
+videolib list UNTAGGED | videolib tags -add needs-review
 
 # Rename a tag across the whole library
-videolib list 'tag:old-tag' | videolib tags -remove old-tag -add new-tag
+videolib list tag:old-tag | videolib tags -remove old-tag -add new-tag
+```
+
+### Setting titles and descriptions
+
+```bash
+# Set a title
+videolib title abc123de "Summer Vacation 2024"
+
+# Write a markdown description
+cat > desc.md << 'EOF'
+# Summer Vacation
+
+Our trip to the **Italian coast**.
+
+## Highlights
+- Swimming at the beach
+- Visiting the old town
+- Amazing sunset views
+
+*Filmed with GoPro Hero 12*
+EOF
+
+videolib description -file desc.md abc123de
+```
+
+### Sharing as read-only
+
+```bash
+# Start in read-only mode for sharing
+videolib serve -readonly -addr :8080 -title "Movie Collection"
 ```
 
 ## File Identification
 
 Videos are identified by a SHA-256 hash of the first 10 MB of file content combined with the total file size. This means:
 
-- **Renaming or moving** a file preserves its identity — tags and thumbnails follow automatically on the next scan
+- **Renaming or moving** a file preserves its identity — tags, titles, descriptions, and thumbnails follow automatically on the next scan
 - **Duplicate files** (identical content) share the same hash — the database tracks the most recently scanned path
 - Files that differ only after the first 10 MB but have different total sizes are distinguished correctly
+
+## Data Portability
+
+The JSON export format (`videolib list -format json`) captures all metadata:
+
+- File path, size, duration, dimensions
+- Tags
+- Title and description
+- Selected main thumbnail index
+- Timestamps (added, modified)
+
+This file can be imported on another machine with `videolib scan backup.json`. On import:
+
+- New videos (by hash) are added with all metadata
+- Existing videos get tags merged (union), and title/description filled in only if currently empty
+- The video files themselves are not included — they must be present on disk and scanned separately
 
 ## License
 

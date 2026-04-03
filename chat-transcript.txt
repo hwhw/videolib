@@ -18160,6 +18160,3804 @@ Videos are identified by a SHA-256 hash of the first 10 MB of file content combi
 MIT
 ```
 
+USER: implement optional title and description fields for videos. both should be editable in single-video view. both will be included in json export/import. when a title is set, it takes precendence over the filename in frontend view, but text list output will only show file name on command line, title and description are not part of that. implement commands for setting title and description from command line. allow them to be read from a file. description will be interpreted as markdown. it will show in single video view in frontend below file name or title. implement a read-only mode for server. tag, title and description editing is disabled in that mode.
+
+ASSISTANT: 
+
+This is a substantial change touching many files. I'll go through each one.
+
+## models/models.go
+
+```go
+package models
+
+import (
+	"fmt"
+	"time"
+)
+
+type Video struct {
+	Hash        string    `json:"hash"`
+	Path        string    `json:"path"`
+	Filename    string    `json:"filename"`
+	Directory   string    `json:"directory"`
+	Size        int64     `json:"size"`
+	Duration    float64   `json:"duration"`
+	Width       int       `json:"width"`
+	Height      int       `json:"height"`
+	Tags        []string  `json:"tags"`
+	ThumbCount  int       `json:"thumb_count"`
+	MainThumb   int       `json:"main_thumb"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	AddedAt     time.Time `json:"added_at"`
+	ModifiedAt  time.Time `json:"modified_at"`
+	FileModTime time.Time `json:"file_mod_time"`
+}
+
+func (v *Video) DisplayName() string {
+	if v.Title != "" {
+		return v.Title
+	}
+	return v.Filename
+}
+
+func (v *Video) DurationString() string {
+	d := time.Duration(v.Duration * float64(time.Second))
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%d:%02d", m, s)
+}
+
+func (v *Video) SizeString() string {
+	const (
+		MB = 1024 * 1024
+		GB = 1024 * MB
+	)
+	switch {
+	case v.Size >= GB:
+		return fmt.Sprintf("%.1f GB", float64(v.Size)/float64(GB))
+	case v.Size >= MB:
+		return fmt.Sprintf("%.1f MB", float64(v.Size)/float64(MB))
+	default:
+		return fmt.Sprintf("%d KB", v.Size/1024)
+	}
+}
+
+func (v *Video) MainThumbIndex() int {
+	if v.MainThumb >= 0 && v.MainThumb < v.ThumbCount {
+		return v.MainThumb
+	}
+	return 0
+}
+
+func (v *Video) MainThumbFilename() string {
+	return fmt.Sprintf("thumb_%02d.jpg", v.MainThumbIndex())
+}
+
+type TagInfo struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+type ExportData struct {
+	Version  int      `json:"version"`
+	Exported string   `json:"exported"`
+	Videos   []*Video `json:"videos"`
+}
+```
+
+## db/database.go
+
+The migration needs a new column, and we need new methods. Replace the full file:
+
+```go
+package db
+
+import (
+	"database/sql"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"videolib/models"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+type Database struct {
+	db *sql.DB
+}
+
+func Open(path string) (*Database, error) {
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on")
+	if err != nil {
+		return nil, fmt.Errorf("opening database: %w", err)
+	}
+
+	d := &Database{db: db}
+	if err := d.migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migration: %w", err)
+	}
+
+	return d, nil
+}
+
+func (d *Database) Close() error {
+	return d.db.Close()
+}
+
+func (d *Database) migrate() error {
+	migrations := []string{
+		`CREATE TABLE IF NOT EXISTS videos (
+			hash TEXT PRIMARY KEY,
+			path TEXT NOT NULL UNIQUE,
+			filename TEXT NOT NULL,
+			directory TEXT NOT NULL,
+			size INTEGER NOT NULL DEFAULT 0,
+			duration REAL NOT NULL DEFAULT 0,
+			width INTEGER NOT NULL DEFAULT 0,
+			height INTEGER NOT NULL DEFAULT 0,
+			thumb_count INTEGER NOT NULL DEFAULT 0,
+			main_thumb INTEGER NOT NULL DEFAULT -1,
+			title TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '',
+			added_at TEXT NOT NULL,
+			modified_at TEXT NOT NULL,
+			file_mod_time TEXT NOT NULL
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS tags (
+			hash TEXT NOT NULL,
+			tag TEXT NOT NULL,
+			PRIMARY KEY (hash, tag),
+			FOREIGN KEY (hash) REFERENCES videos(hash) ON DELETE CASCADE
+		)`,
+
+		`CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag)`,
+		`CREATE INDEX IF NOT EXISTS idx_tags_hash ON tags(hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_videos_path ON videos(path)`,
+		`CREATE INDEX IF NOT EXISTS idx_videos_directory ON videos(directory)`,
+
+		`CREATE VIRTUAL TABLE IF NOT EXISTS videos_fts USING fts5(
+			hash UNINDEXED,
+			filename,
+			path,
+			directory,
+			title,
+			content='videos',
+			content_rowid='rowid',
+			tokenize='unicode61 remove_diacritics 2'
+		)`,
+
+		`CREATE TRIGGER IF NOT EXISTS videos_ai AFTER INSERT ON videos BEGIN
+			INSERT INTO videos_fts(rowid, hash, filename, path, directory, title)
+			VALUES (new.rowid, new.hash, new.filename, new.path, new.directory, new.title);
+		END`,
+
+		`CREATE TRIGGER IF NOT EXISTS videos_ad AFTER DELETE ON videos BEGIN
+			INSERT INTO videos_fts(videos_fts, rowid, hash, filename, path, directory, title)
+			VALUES ('delete', old.rowid, old.hash, old.filename, old.path, old.directory, old.title);
+		END`,
+
+		`CREATE TRIGGER IF NOT EXISTS videos_au AFTER UPDATE ON videos BEGIN
+			INSERT INTO videos_fts(videos_fts, rowid, hash, filename, path, directory, title)
+			VALUES ('delete', old.rowid, old.hash, old.filename, old.path, old.directory, old.title);
+			INSERT INTO videos_fts(rowid, hash, filename, path, directory, title)
+			VALUES (new.rowid, new.hash, new.filename, new.path, new.directory, new.title);
+		END`,
+	}
+
+	for _, m := range migrations {
+		if _, err := d.db.Exec(m); err != nil {
+			return fmt.Errorf("executing migration: %w\nSQL: %s", err, m)
+		}
+	}
+
+	// Add columns if upgrading from older schema
+	d.addColumnIfMissing("videos", "title", "TEXT NOT NULL DEFAULT ''")
+	d.addColumnIfMissing("videos", "description", "TEXT NOT NULL DEFAULT ''")
+
+	return nil
+}
+
+func (d *Database) addColumnIfMissing(table, column, colDef string) {
+	var count int
+	err := d.db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+		table, column,
+	).Scan(&count)
+	if err != nil || count > 0 {
+		return
+	}
+	d.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, colDef))
+}
+
+// === Video CRUD ===
+
+const videoColumns = `hash, path, filename, directory, size, duration, width, height,
+	thumb_count, main_thumb, title, description, added_at, modified_at, file_mod_time`
+
+func (d *Database) PutVideo(v *models.Video) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
+		INSERT INTO videos (hash, path, filename, directory, size, duration, width, height,
+			thumb_count, main_thumb, title, description, added_at, modified_at, file_mod_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(hash) DO UPDATE SET
+			path=excluded.path, filename=excluded.filename, directory=excluded.directory,
+			size=excluded.size, duration=excluded.duration, width=excluded.width, height=excluded.height,
+			thumb_count=excluded.thumb_count, main_thumb=excluded.main_thumb,
+			title=excluded.title, description=excluded.description,
+			modified_at=excluded.modified_at, file_mod_time=excluded.file_mod_time
+	`,
+		v.Hash, v.Path, v.Filename, v.Directory, v.Size, v.Duration, v.Width, v.Height,
+		v.ThumbCount, v.MainThumb, v.Title, v.Description,
+		v.AddedAt.Format(time.RFC3339), v.ModifiedAt.Format(time.RFC3339),
+		v.FileModTime.Format(time.RFC3339),
+	)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec("DELETE FROM tags WHERE hash = ?", v.Hash)
+	if err != nil {
+		return err
+	}
+
+	if len(v.Tags) > 0 {
+		stmt, err := tx.Prepare("INSERT OR IGNORE INTO tags (hash, tag) VALUES (?, ?)")
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+
+		for _, tag := range v.Tags {
+			tag = strings.ToLower(strings.TrimSpace(tag))
+			tag = strings.ReplaceAll(tag, " ", "")
+			if tag != "" {
+				if _, err := stmt.Exec(v.Hash, tag); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (d *Database) UpdateVideoPath(v *models.Video, oldPath string) error {
+	_, err := d.db.Exec(`
+		UPDATE videos SET
+			path = ?, filename = ?, directory = ?,
+			size = ?, file_mod_time = ?, modified_at = ?
+		WHERE hash = ?
+	`,
+		v.Path, v.Filename, v.Directory,
+		v.Size, v.FileModTime.Format(time.RFC3339), v.ModifiedAt.Format(time.RFC3339),
+		v.Hash,
+	)
+	return err
+}
+
+func (d *Database) GetVideo(hash string) (*models.Video, error) {
+	v := &models.Video{}
+	var addedAt, modifiedAt, fileModTime string
+
+	err := d.db.QueryRow(`
+		SELECT `+videoColumns+`
+		FROM videos WHERE hash = ?
+	`, hash).Scan(
+		&v.Hash, &v.Path, &v.Filename, &v.Directory, &v.Size, &v.Duration,
+		&v.Width, &v.Height, &v.ThumbCount, &v.MainThumb,
+		&v.Title, &v.Description,
+		&addedAt, &modifiedAt, &fileModTime,
+	)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("video not found: %s", hash)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	v.AddedAt, _ = time.Parse(time.RFC3339, addedAt)
+	v.ModifiedAt, _ = time.Parse(time.RFC3339, modifiedAt)
+	v.FileModTime, _ = time.Parse(time.RFC3339, fileModTime)
+
+	tags, err := d.getVideoTags(v.Hash)
+	if err != nil {
+		return nil, err
+	}
+	v.Tags = tags
+
+	return v, nil
+}
+
+func (d *Database) DeleteVideo(hash string) error {
+	_, err := d.db.Exec("DELETE FROM videos WHERE hash = ?", hash)
+	return err
+}
+
+func (d *Database) SetTitle(hash string, title string) error {
+	_, err := d.db.Exec(
+		"UPDATE videos SET title = ?, modified_at = ? WHERE hash = ?",
+		title, time.Now().Format(time.RFC3339), hash,
+	)
+	return err
+}
+
+func (d *Database) SetDescription(hash string, description string) error {
+	_, err := d.db.Exec(
+		"UPDATE videos SET description = ?, modified_at = ? WHERE hash = ?",
+		description, time.Now().Format(time.RFC3339), hash,
+	)
+	return err
+}
+
+func (d *Database) GetAllPaths() (map[string]string, error) {
+	rows, err := d.db.Query("SELECT path, hash FROM videos")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	paths := make(map[string]string)
+	for rows.Next() {
+		var path, hash string
+		if err := rows.Scan(&path, &hash); err != nil {
+			return nil, err
+		}
+		paths[path] = hash
+	}
+	return paths, rows.Err()
+}
+
+func (d *Database) GetAllHashes() (map[string]bool, error) {
+	rows, err := d.db.Query("SELECT hash FROM videos")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	hashes := make(map[string]bool)
+	for rows.Next() {
+		var hash string
+		if err := rows.Scan(&hash); err != nil {
+			return nil, err
+		}
+		hashes[hash] = true
+	}
+	return hashes, rows.Err()
+}
+
+// === Full-Text Search ===
+
+func (d *Database) FullTextSearch(query string) ([]*models.Video, error) {
+	ftsQuery := sanitizeFTSQuery(query)
+
+	rows, err := d.db.Query(`
+		SELECT v.hash, v.path, v.filename, v.directory, v.size, v.duration,
+			v.width, v.height, v.thumb_count, v.main_thumb,
+			v.title, v.description,
+			v.added_at, v.modified_at, v.file_mod_time
+		FROM videos_fts f
+		JOIN videos v ON v.hash = f.hash
+		WHERE videos_fts MATCH ?
+		ORDER BY rank
+	`, ftsQuery)
+	if err != nil {
+		return nil, fmt.Errorf("FTS query error: %w (query: %s)", err, ftsQuery)
+	}
+	defer rows.Close()
+
+	return d.scanVideosWithTags(rows)
+}
+
+func sanitizeFTSQuery(input string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return ""
+	}
+
+	var parts []string
+	inQuote := false
+	var current strings.Builder
+
+	for i := 0; i < len(input); i++ {
+		ch := input[i]
+		switch {
+		case ch == '"':
+			if inQuote {
+				current.WriteByte('"')
+				parts = append(parts, current.String())
+				current.Reset()
+				inQuote = false
+			} else {
+				if current.Len() > 0 {
+					parts = append(parts, current.String())
+					current.Reset()
+				}
+				current.WriteByte('"')
+				inQuote = true
+			}
+		case ch == ' ' && !inQuote:
+			if current.Len() > 0 {
+				parts = append(parts, current.String())
+				current.Reset()
+			}
+		case ch == '*':
+			current.WriteByte('*')
+		default:
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+				(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' {
+				current.WriteByte(ch)
+			} else if inQuote && ch == ' ' {
+				current.WriteByte(' ')
+			}
+		}
+	}
+
+	if current.Len() > 0 {
+		s := current.String()
+		if inQuote {
+			s += `"`
+		}
+		parts = append(parts, s)
+	}
+
+	return strings.Join(parts, " AND ")
+}
+
+// === Tag Query Engine ===
+
+func (d *Database) SearchByQuery(query string) ([]*models.Video, error) {
+	tokens := tokenizeQuery(query)
+	if len(tokens) == 0 {
+		return d.ListAllVideos()
+	}
+
+	parser := &queryParser{tokens: tokens, pos: 0}
+	sqlWhere, args, err := parser.parseExpression()
+	if err != nil {
+		return nil, fmt.Errorf("query parse error: %w", err)
+	}
+
+	sqlStr := `
+		SELECT DISTINCT v.hash, v.path, v.filename, v.directory, v.size, v.duration,
+			v.width, v.height, v.thumb_count, v.main_thumb,
+			v.title, v.description,
+			v.added_at, v.modified_at, v.file_mod_time
+		FROM videos v
+		WHERE ` + sqlWhere + `
+		ORDER BY v.filename
+	`
+
+	rows, err := d.db.Query(sqlStr, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search query error: %w\nSQL: %s\nArgs: %v", err, sqlStr, args)
+	}
+	defer rows.Close()
+
+	return d.scanVideosWithTags(rows)
+}
+
+type tokenType int
+
+const (
+	tokWord     tokenType = iota
+	tokPhrase
+	tokTag
+	tokDuration
+	tokSize
+	tokPath
+	tokIPath
+	tokAnd
+	tokOr
+	tokNot
+	tokLParen
+	tokRParen
+)
+
+type token struct {
+	typ tokenType
+	val string
+}
+
+func tokenizeQuery(input string) []token {
+	var tokens []token
+	input = strings.TrimSpace(input)
+	i := 0
+
+	for i < len(input) {
+		if input[i] == ' ' || input[i] == '\t' {
+			i++
+			continue
+		}
+		if input[i] == '(' {
+			tokens = append(tokens, token{tokLParen, "("})
+			i++
+			continue
+		}
+		if input[i] == ')' {
+			tokens = append(tokens, token{tokRParen, ")"})
+			i++
+			continue
+		}
+		if input[i] == '"' {
+			i++
+			start := i
+			for i < len(input) && input[i] != '"' {
+				i++
+			}
+			phrase := input[start:i]
+			if i < len(input) {
+				i++
+			}
+			phrase = strings.TrimSpace(phrase)
+			if phrase != "" {
+				tokens = append(tokens, token{tokPhrase, phrase})
+			}
+			continue
+		}
+
+		start := i
+		for i < len(input) && input[i] != ' ' && input[i] != '\t' &&
+			input[i] != '(' && input[i] != ')' {
+			if input[i] == '"' {
+				break
+			}
+			i++
+		}
+
+		word := input[start:i]
+		lower := strings.ToLower(word)
+
+		prefixType, prefixLen := classifyPrefix(lower)
+		if prefixType != tokWord && prefixLen == len(word) {
+			val := readPrefixValue(input, &i)
+			if val != "" {
+				switch prefixType {
+				case tokTag:
+					tokens = append(tokens, token{tokTag, strings.ToLower(val)})
+				case tokDuration:
+					tokens = append(tokens, token{tokDuration, strings.ToLower(val)})
+				case tokSize:
+					tokens = append(tokens, token{tokSize, strings.ToLower(val)})
+				case tokPath:
+					tokens = append(tokens, token{tokPath, val})
+				case tokIPath:
+					tokens = append(tokens, token{tokIPath, val})
+				}
+			}
+			continue
+		}
+
+		if prefixType != tokWord && prefixLen < len(word) {
+			val := word[prefixLen:]
+			switch prefixType {
+			case tokTag:
+				tokens = append(tokens, token{tokTag, strings.ToLower(val)})
+			case tokDuration:
+				tokens = append(tokens, token{tokDuration, strings.ToLower(val)})
+			case tokSize:
+				tokens = append(tokens, token{tokSize, strings.ToLower(val)})
+			case tokPath:
+				tokens = append(tokens, token{tokPath, val})
+			case tokIPath:
+				tokens = append(tokens, token{tokIPath, val})
+			}
+			continue
+		}
+
+		upper := strings.ToUpper(word)
+		switch upper {
+		case "AND":
+			tokens = append(tokens, token{tokAnd, "AND"})
+		case "OR":
+			tokens = append(tokens, token{tokOr, "OR"})
+		case "NOT":
+			tokens = append(tokens, token{tokNot, "NOT"})
+		default:
+			tokens = append(tokens, token{tokWord, word})
+		}
+	}
+
+	return tokens
+}
+
+func classifyPrefix(lower string) (tokenType, int) {
+	prefixes := []struct {
+		prefix string
+		typ    tokenType
+	}{
+		{"ipath:", tokIPath},
+		{"path:", tokPath},
+		{"tag:", tokTag},
+		{"duration:", tokDuration},
+		{"size:", tokSize},
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(lower, p.prefix) {
+			return p.typ, len(p.prefix)
+		}
+	}
+	return tokWord, 0
+}
+
+func readPrefixValue(input string, i *int) string {
+	if *i >= len(input) {
+		return ""
+	}
+	if input[*i] == '"' {
+		*i++
+		start := *i
+		for *i < len(input) && input[*i] != '"' {
+			*i++
+		}
+		val := input[start:*i]
+		if *i < len(input) {
+			*i++
+		}
+		return val
+	}
+	start := *i
+	for *i < len(input) && input[*i] != ' ' && input[*i] != '\t' &&
+		input[*i] != '(' && input[*i] != ')' {
+		*i++
+	}
+	return input[start:*i]
+}
+
+type queryParser struct {
+	tokens []token
+	pos    int
+}
+
+func (p *queryParser) peek() *token {
+	if p.pos >= len(p.tokens) {
+		return nil
+	}
+	return &p.tokens[p.pos]
+}
+
+func (p *queryParser) next() *token {
+	if p.pos >= len(p.tokens) {
+		return nil
+	}
+	t := &p.tokens[p.pos]
+	p.pos++
+	return t
+}
+
+func (p *queryParser) parseExpression() (string, []interface{}, error) {
+	left, args, err := p.parseAnd()
+	if err != nil {
+		return "", nil, err
+	}
+	for {
+		t := p.peek()
+		if t == nil || t.typ != tokOr {
+			break
+		}
+		p.next()
+		right, rightArgs, err := p.parseAnd()
+		if err != nil {
+			return "", nil, err
+		}
+		left = "(" + left + " OR " + right + ")"
+		args = append(args, rightArgs...)
+	}
+	return left, args, nil
+}
+
+func (p *queryParser) parseAnd() (string, []interface{}, error) {
+	left, args, err := p.parseUnary()
+	if err != nil {
+		return "", nil, err
+	}
+	for {
+		t := p.peek()
+		if t == nil {
+			break
+		}
+		if t.typ == tokAnd {
+			p.next()
+		} else if t.typ == tokWord || t.typ == tokPhrase || t.typ == tokTag ||
+			t.typ == tokDuration || t.typ == tokSize ||
+			t.typ == tokPath || t.typ == tokIPath ||
+			t.typ == tokNot || t.typ == tokLParen {
+		} else {
+			break
+		}
+		right, rightArgs, err := p.parseUnary()
+		if err != nil {
+			return "", nil, err
+		}
+		left = "(" + left + " AND " + right + ")"
+		args = append(args, rightArgs...)
+	}
+	return left, args, nil
+}
+
+func (p *queryParser) parseUnary() (string, []interface{}, error) {
+	t := p.peek()
+	if t == nil {
+		return "", nil, fmt.Errorf("unexpected end of query")
+	}
+	if t.typ == tokNot {
+		p.next()
+		inner, args, err := p.parseUnary()
+		if err != nil {
+			return "", nil, err
+		}
+		return "NOT (" + inner + ")", args, nil
+	}
+	return p.parseAtom()
+}
+
+func (p *queryParser) parseAtom() (string, []interface{}, error) {
+	t := p.peek()
+	if t == nil {
+		return "", nil, fmt.Errorf("unexpected end of query")
+	}
+	if t.typ == tokLParen {
+		p.next()
+		expr, args, err := p.parseExpression()
+		if err != nil {
+			return "", nil, err
+		}
+		closing := p.next()
+		if closing == nil || closing.typ != tokRParen {
+			return "", nil, fmt.Errorf("expected closing parenthesis")
+		}
+		return expr, args, nil
+	}
+	if t.typ == tokTag {
+		p.next()
+		tagValue := t.val
+		if strings.Contains(tagValue, "*") {
+			likePattern := strings.ReplaceAll(tagValue, "*", "%")
+			return "v.hash IN (SELECT hash FROM tags WHERE tag LIKE ?)", []interface{}{likePattern}, nil
+		}
+		return "v.hash IN (SELECT hash FROM tags WHERE tag = ?)", []interface{}{tagValue}, nil
+	}
+	if t.typ == tokDuration {
+		p.next()
+		return parseDurationFilter(t.val)
+	}
+	if t.typ == tokSize {
+		p.next()
+		return parseSizeFilter(t.val)
+	}
+	if t.typ == tokPath {
+		p.next()
+		return parsePathFilter(t.val, false)
+	}
+	if t.typ == tokIPath {
+		p.next()
+		return parsePathFilter(t.val, true)
+	}
+	if t.typ == tokPhrase {
+		p.next()
+		ftsPhrase := sanitizeFTSPhrase(t.val)
+		if ftsPhrase == "" {
+			return "1=1", nil, nil
+		}
+		return `v.hash IN (SELECT hash FROM videos_fts WHERE videos_fts MATCH ?)`,
+			[]interface{}{ftsPhrase}, nil
+	}
+	if t.typ != tokWord {
+		return "", nil, fmt.Errorf("unexpected token: %s", t.val)
+	}
+	p.next()
+	word := t.val
+	upper := strings.ToUpper(word)
+	if upper == "UNTAGGED" {
+		return "v.hash NOT IN (SELECT DISTINCT hash FROM tags)", nil, nil
+	}
+	if upper == "TAGGED" {
+		return "v.hash IN (SELECT DISTINCT hash FROM tags)", nil, nil
+	}
+	ftsWord := sanitizeFTSWord(word)
+	if ftsWord == "" {
+		return "1=1", nil, nil
+	}
+	return `v.hash IN (SELECT hash FROM videos_fts WHERE videos_fts MATCH ?)`,
+		[]interface{}{ftsWord}, nil
+}
+
+func sanitizeFTSWord(word string) string {
+	var b strings.Builder
+	for _, ch := range word {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' {
+			b.WriteRune(ch)
+		} else if ch == '*' {
+			b.WriteRune('*')
+		}
+	}
+	return b.String()
+}
+
+func sanitizeFTSPhrase(phrase string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, ch := range phrase {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' || ch == ' ' {
+			b.WriteRune(ch)
+		}
+	}
+	b.WriteByte('"')
+	result := b.String()
+	if result == `""` {
+		return ""
+	}
+	return result
+}
+
+func parseDurationFilter(val string) (string, []interface{}, error) {
+	if len(val) < 2 {
+		return "", nil, fmt.Errorf("invalid duration filter: %s", val)
+	}
+	op := val[0]
+	if op != '+' && op != '-' {
+		return "", nil, fmt.Errorf("invalid duration filter: %s (need + or - prefix)", val)
+	}
+	seconds, err := parseDurationValue(val[1:])
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid duration filter: %s: %w", val, err)
+	}
+	if op == '+' {
+		return "v.duration >= ?", []interface{}{seconds}, nil
+	}
+	return "v.duration < ?", []interface{}{seconds}, nil
+}
+
+func parseDurationValue(s string) (float64, error) {
+	parts := strings.Split(s, ":")
+	switch len(parts) {
+	case 1:
+		return strconv.ParseFloat(parts[0], 64)
+	case 2:
+		mins, err := strconv.ParseFloat(parts[0], 64)
+		if err != nil {
+			return 0, err
+		}
+		secs, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			return 0, err
+		}
+		return mins*60 + secs, nil
+	case 3:
+		hours, err := strconv.ParseFloat(parts[0], 64)
+		if err != nil {
+			return 0, err
+		}
+		mins, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			return 0, err
+		}
+		secs, err := strconv.ParseFloat(parts[2], 64)
+		if err != nil {
+			return 0, err
+		}
+		return hours*3600 + mins*60 + secs, nil
+	default:
+		return 0, fmt.Errorf("invalid duration format: %s", s)
+	}
+}
+
+func parseSizeFilter(val string) (string, []interface{}, error) {
+	if len(val) < 2 {
+		return "", nil, fmt.Errorf("invalid size filter: %s", val)
+	}
+	op := val[0]
+	if op != '+' && op != '-' {
+		return "", nil, fmt.Errorf("invalid size filter: %s (need + or - prefix)", val)
+	}
+	bytes, err := parseSizeValue(val[1:])
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid size filter: %s: %w", val, err)
+	}
+	if op == '+' {
+		return "v.size >= ?", []interface{}{bytes}, nil
+	}
+	return "v.size < ?", []interface{}{bytes}, nil
+}
+
+func parseSizeValue(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty size value")
+	}
+	var multiplier int64 = 1
+	last := strings.ToLower(s[len(s)-1:])
+	switch last {
+	case "k":
+		multiplier = 1024
+		s = s[:len(s)-1]
+	case "m":
+		multiplier = 1024 * 1024
+		s = s[:len(s)-1]
+	case "g":
+		multiplier = 1024 * 1024 * 1024
+		s = s[:len(s)-1]
+	}
+	num, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid number: %s", s)
+	}
+	return int64(num * float64(multiplier)), nil
+}
+
+func parsePathFilter(pattern string, caseInsensitive bool) (string, []interface{}, error) {
+	if pattern == "" {
+		return "1=1", nil, nil
+	}
+	if caseInsensitive {
+		likePattern := globToLike(pattern)
+		return "LOWER(v.path) LIKE LOWER(?)", []interface{}{likePattern}, nil
+	}
+	return "v.path GLOB ?", []interface{}{pattern}, nil
+}
+
+func globToLike(glob string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(glob) {
+		ch := glob[i]
+		switch ch {
+		case '*':
+			b.WriteByte('%')
+		case '?':
+			b.WriteByte('_')
+		case '[':
+			j := i + 1
+			for j < len(glob) && glob[j] != ']' {
+				j++
+			}
+			if j < len(glob) {
+				i = j
+			}
+			b.WriteByte('%')
+		case '%':
+			b.WriteString(`\%`)
+		case '_':
+			b.WriteString(`\_`)
+		case '\\':
+			b.WriteString(`\\`)
+		default:
+			b.WriteByte(ch)
+		}
+		i++
+	}
+	return b.String()
+}
+
+// === Simple Tag Operations ===
+
+func (d *Database) getVideoTags(hash string) ([]string, error) {
+	rows, err := d.db.Query("SELECT tag FROM tags WHERE hash = ? ORDER BY tag", hash)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tags []string
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			return nil, err
+		}
+		tags = append(tags, tag)
+	}
+	if tags == nil {
+		tags = []string{}
+	}
+	return tags, rows.Err()
+}
+
+func (d *Database) AddTags(hash string, tags []string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO tags (hash, tag) VALUES (?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, t := range tags {
+		t = strings.ToLower(strings.TrimSpace(t))
+		t = strings.ReplaceAll(t, " ", "")
+		if t != "" {
+			stmt.Exec(hash, t)
+		}
+	}
+	tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?", time.Now().Format(time.RFC3339), hash)
+	return tx.Commit()
+}
+
+func (d *Database) SetTags(hash string, tags []string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	tx.Exec("DELETE FROM tags WHERE hash = ?", hash)
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO tags (hash, tag) VALUES (?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	seen := make(map[string]bool)
+	for _, t := range tags {
+		t = strings.ToLower(strings.TrimSpace(t))
+		t = strings.ReplaceAll(t, " ", "")
+		if t != "" && !seen[t] {
+			seen[t] = true
+			stmt.Exec(hash, t)
+		}
+	}
+	tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?", time.Now().Format(time.RFC3339), hash)
+	return tx.Commit()
+}
+
+func (d *Database) RemoveTags(hash string, tags []string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare("DELETE FROM tags WHERE hash = ? AND tag = ?")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, t := range tags {
+		t = strings.ToLower(strings.TrimSpace(t))
+		t = strings.ReplaceAll(t, " ", "")
+		if t != "" {
+			stmt.Exec(hash, t)
+		}
+	}
+	tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?", time.Now().Format(time.RFC3339), hash)
+	return tx.Commit()
+}
+
+func (d *Database) BulkAddTags(hashes []string, tags []string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO tags (hash, tag) VALUES (?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	now := time.Now().Format(time.RFC3339)
+	upd, _ := tx.Prepare("UPDATE videos SET modified_at = ? WHERE hash = ?")
+	defer upd.Close()
+	for _, hash := range hashes {
+		for _, t := range tags {
+			t = strings.ToLower(strings.TrimSpace(t))
+			t = strings.ReplaceAll(t, " ", "")
+			if t != "" {
+				stmt.Exec(hash, t)
+			}
+		}
+		upd.Exec(now, hash)
+	}
+	return tx.Commit()
+}
+
+func (d *Database) BulkRemoveTags(hashes []string, tags []string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare("DELETE FROM tags WHERE hash = ? AND tag = ?")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	now := time.Now().Format(time.RFC3339)
+	upd, _ := tx.Prepare("UPDATE videos SET modified_at = ? WHERE hash = ?")
+	defer upd.Close()
+	for _, hash := range hashes {
+		for _, t := range tags {
+			t = strings.ToLower(strings.TrimSpace(t))
+			t = strings.ReplaceAll(t, " ", "")
+			if t != "" {
+				stmt.Exec(hash, t)
+			}
+		}
+		upd.Exec(now, hash)
+	}
+	return tx.Commit()
+}
+
+func (d *Database) SetMainThumb(hash string, thumbIndex int) error {
+	_, err := d.db.Exec(
+		"UPDATE videos SET main_thumb = ?, modified_at = ? WHERE hash = ?",
+		thumbIndex, time.Now().Format(time.RFC3339), hash,
+	)
+	return err
+}
+
+// === Listing ===
+
+func (d *Database) ListAllVideos() ([]*models.Video, error) {
+	rows, err := d.db.Query(`
+		SELECT ` + videoColumns + `
+		FROM videos ORDER BY filename
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return d.scanVideosWithTags(rows)
+}
+
+func (d *Database) ListAllTags() ([]models.TagInfo, error) {
+	rows, err := d.db.Query(`SELECT tag, COUNT(*) as cnt FROM tags GROUP BY tag ORDER BY tag`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tags []models.TagInfo
+	for rows.Next() {
+		var t models.TagInfo
+		if err := rows.Scan(&t.Name, &t.Count); err != nil {
+			return nil, err
+		}
+		tags = append(tags, t)
+	}
+	return tags, rows.Err()
+}
+
+// === Export / Import ===
+
+func (d *Database) Export() (*models.ExportData, error) {
+	videos, err := d.ListAllVideos()
+	if err != nil {
+		return nil, err
+	}
+	return &models.ExportData{
+		Version:  1,
+		Exported: time.Now().UTC().Format(time.RFC3339),
+		Videos:   videos,
+	}, nil
+}
+
+func (d *Database) Import(data *models.ExportData) (added, updated, skipped int, err error) {
+	for _, v := range data.Videos {
+		existing, existErr := d.GetVideo(v.Hash)
+		if existErr != nil {
+			if putErr := d.PutVideo(v); putErr != nil {
+				skipped++
+				continue
+			}
+			added++
+		} else {
+			changed := false
+
+			existingTags := make(map[string]bool)
+			for _, t := range existing.Tags {
+				existingTags[t] = true
+			}
+			var newTags []string
+			for _, t := range v.Tags {
+				t = strings.ToLower(strings.TrimSpace(t))
+				if t != "" && !existingTags[t] {
+					newTags = append(newTags, t)
+				}
+			}
+			if len(newTags) > 0 {
+				d.AddTags(existing.Hash, newTags)
+				changed = true
+			}
+			if existing.MainThumb <= 0 && v.MainThumb > 0 {
+				d.SetMainThumb(existing.Hash, v.MainThumb)
+				changed = true
+			}
+			if existing.Title == "" && v.Title != "" {
+				d.SetTitle(existing.Hash, v.Title)
+				changed = true
+			}
+			if existing.Description == "" && v.Description != "" {
+				d.SetDescription(existing.Hash, v.Description)
+				changed = true
+			}
+
+			if changed {
+				updated++
+			} else {
+				skipped++
+			}
+		}
+	}
+	return
+}
+
+// === Helpers ===
+
+func (d *Database) scanVideosWithTags(rows *sql.Rows) ([]*models.Video, error) {
+	var videos []*models.Video
+	for rows.Next() {
+		v := &models.Video{}
+		var addedAt, modifiedAt, fileModTime string
+
+		err := rows.Scan(
+			&v.Hash, &v.Path, &v.Filename, &v.Directory, &v.Size, &v.Duration,
+			&v.Width, &v.Height, &v.ThumbCount, &v.MainThumb,
+			&v.Title, &v.Description,
+			&addedAt, &modifiedAt, &fileModTime,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		v.AddedAt, _ = time.Parse(time.RFC3339, addedAt)
+		v.ModifiedAt, _ = time.Parse(time.RFC3339, modifiedAt)
+		v.FileModTime, _ = time.Parse(time.RFC3339, fileModTime)
+
+		tags, err := d.getVideoTags(v.Hash)
+		if err != nil {
+			return nil, err
+		}
+		v.Tags = tags
+		videos = append(videos, v)
+	}
+	if videos == nil {
+		videos = []*models.Video{}
+	}
+	return videos, rows.Err()
+}
+
+func (d *Database) SearchByTags(tags []string) ([]*models.Video, error) {
+	if len(tags) == 0 {
+		return d.ListAllVideos()
+	}
+	normalized := make([]string, 0, len(tags))
+	for _, t := range tags {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t != "" {
+			normalized = append(normalized, t)
+		}
+	}
+	sort.Strings(normalized)
+
+	var parts []string
+	var args []interface{}
+	for _, t := range normalized {
+		parts = append(parts, "SELECT hash FROM tags WHERE tag = ?")
+		args = append(args, t)
+	}
+	hashQuery := strings.Join(parts, " INTERSECT ")
+
+	sqlStr := `
+		SELECT v.hash, v.path, v.filename, v.directory, v.size, v.duration,
+			v.width, v.height, v.thumb_count, v.main_thumb,
+			v.title, v.description,
+			v.added_at, v.modified_at, v.file_mod_time
+		FROM videos v
+		WHERE v.hash IN (` + hashQuery + `)
+		ORDER BY v.filename
+	`
+	rows, err := d.db.Query(sqlStr, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return d.scanVideosWithTags(rows)
+}
+```
+
+## handlers/api.go
+
+```go
+package handlers
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"strings"
+
+	"videolib/db"
+)
+
+type APIHandler struct {
+	DB       *db.Database
+	ReadOnly bool
+}
+
+func NewAPIHandler(database *db.Database, readOnly bool) *APIHandler {
+	return &APIHandler{DB: database, ReadOnly: readOnly}
+}
+
+func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func (h *APIHandler) checkWritable(w http.ResponseWriter) bool {
+	if h.ReadOnly {
+		writeError(w, 403, "server is in read-only mode")
+		return false
+	}
+	return true
+}
+
+func (h *APIHandler) ListVideos(w http.ResponseWriter, r *http.Request) {
+	search := r.URL.Query().Get("search")
+	query := r.URL.Query().Get("q")
+	tagsParam := r.URL.Query().Get("tags")
+
+	if search != "" {
+		videos, err := h.DB.SearchByQuery(search)
+		if err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		writeJSON(w, 200, videos)
+		return
+	}
+	if tagsParam != "" {
+		tags := strings.Split(tagsParam, ",")
+		for i := range tags {
+			tags[i] = strings.TrimSpace(tags[i])
+		}
+		videos, err := h.DB.SearchByTags(tags)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, videos)
+		return
+	}
+	if query != "" {
+		videos, err := h.DB.FullTextSearch(query)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, videos)
+		return
+	}
+	videos, err := h.DB.ListAllVideos()
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, videos)
+}
+
+func (h *APIHandler) GetVideo(w http.ResponseWriter, r *http.Request) {
+	hash := r.PathValue("hash")
+	if hash == "" {
+		writeError(w, 400, "missing hash")
+		return
+	}
+	video, err := h.DB.GetVideo(hash)
+	if err != nil {
+		writeError(w, 404, err.Error())
+		return
+	}
+	writeJSON(w, 200, video)
+}
+
+func (h *APIHandler) AddTags(w http.ResponseWriter, r *http.Request) {
+	if !h.checkWritable(w) {
+		return
+	}
+	hash := r.PathValue("hash")
+	if hash == "" {
+		writeError(w, 400, "missing hash")
+		return
+	}
+	var body struct {
+		Tags []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	if err := h.DB.AddTags(hash, body.Tags); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	video, _ := h.DB.GetVideo(hash)
+	writeJSON(w, 200, video)
+}
+
+func (h *APIHandler) SetTags(w http.ResponseWriter, r *http.Request) {
+	if !h.checkWritable(w) {
+		return
+	}
+	hash := r.PathValue("hash")
+	if hash == "" {
+		writeError(w, 400, "missing hash")
+		return
+	}
+	var body struct {
+		Tags []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	if err := h.DB.SetTags(hash, body.Tags); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	video, _ := h.DB.GetVideo(hash)
+	writeJSON(w, 200, video)
+}
+
+func (h *APIHandler) RemoveTags(w http.ResponseWriter, r *http.Request) {
+	if !h.checkWritable(w) {
+		return
+	}
+	hash := r.PathValue("hash")
+	if hash == "" {
+		writeError(w, 400, "missing hash")
+		return
+	}
+	var body struct {
+		Tags []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	if err := h.DB.RemoveTags(hash, body.Tags); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	video, _ := h.DB.GetVideo(hash)
+	writeJSON(w, 200, video)
+}
+
+func (h *APIHandler) BulkTags(w http.ResponseWriter, r *http.Request) {
+	if !h.checkWritable(w) {
+		return
+	}
+	var body struct {
+		Hashes []string `json:"hashes"`
+		Tags   []string `json:"tags"`
+		Action string   `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	log.Printf("Bulk tag %s: %d videos, tags: %v", body.Action, len(body.Hashes), body.Tags)
+	var err error
+	switch body.Action {
+	case "add":
+		err = h.DB.BulkAddTags(body.Hashes, body.Tags)
+	case "remove":
+		err = h.DB.BulkRemoveTags(body.Hashes, body.Tags)
+	default:
+		writeError(w, 400, "action must be 'add' or 'remove'")
+		return
+	}
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (h *APIHandler) SetMainThumb(w http.ResponseWriter, r *http.Request) {
+	if !h.checkWritable(w) {
+		return
+	}
+	hash := r.PathValue("hash")
+	if hash == "" {
+		writeError(w, 400, "missing hash")
+		return
+	}
+	var body struct {
+		Index int `json:"index"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	if err := h.DB.SetMainThumb(hash, body.Index); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	video, _ := h.DB.GetVideo(hash)
+	writeJSON(w, 200, video)
+}
+
+func (h *APIHandler) SetTitle(w http.ResponseWriter, r *http.Request) {
+	if !h.checkWritable(w) {
+		return
+	}
+	hash := r.PathValue("hash")
+	if hash == "" {
+		writeError(w, 400, "missing hash")
+		return
+	}
+	var body struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	if err := h.DB.SetTitle(hash, body.Title); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	video, _ := h.DB.GetVideo(hash)
+	writeJSON(w, 200, video)
+}
+
+func (h *APIHandler) SetDescription(w http.ResponseWriter, r *http.Request) {
+	if !h.checkWritable(w) {
+		return
+	}
+	hash := r.PathValue("hash")
+	if hash == "" {
+		writeError(w, 400, "missing hash")
+		return
+	}
+	var body struct {
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	if err := h.DB.SetDescription(hash, body.Description); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	video, _ := h.DB.GetVideo(hash)
+	writeJSON(w, 200, video)
+}
+
+func (h *APIHandler) ListTags(w http.ResponseWriter, r *http.Request) {
+	tags, err := h.DB.ListAllTags()
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, tags)
+}
+
+// ConfigHandler returns frontend configuration (like read-only mode)
+func (h *APIHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]interface{}{
+		"read_only": h.ReadOnly,
+	})
+}
+```
+
+## handlers/pages.go
+
+```go
+package handlers
+
+import (
+	"html/template"
+	"io/fs"
+	"log"
+	"net/http"
+
+	"videolib/db"
+)
+
+type PageHandler struct {
+	DB        *db.Database
+	Templates map[string]*template.Template
+	Title     string
+	ReadOnly  bool
+}
+
+type pageData struct {
+	Title    string
+	ReadOnly bool
+	Data     interface{}
+}
+
+func NewPageHandler(database *db.Database, templateFS fs.FS, title string, readOnly bool) (*PageHandler, error) {
+	funcMap := template.FuncMap{
+		"join": func(s []string, sep string) string {
+			result := ""
+			for i, v := range s {
+				if i > 0 {
+					result += sep
+				}
+				result += v
+			}
+			return result
+		},
+		"urlquery": template.URLQueryEscaper,
+	}
+
+	layoutBytes, err := fs.ReadFile(templateFS, "layout.html")
+	if err != nil {
+		return nil, err
+	}
+	layoutStr := string(layoutBytes)
+
+	pageFiles := []string{"index.html", "video.html", "tags.html"}
+	templates := make(map[string]*template.Template)
+
+	for _, page := range pageFiles {
+		pageBytes, err := fs.ReadFile(templateFS, page)
+		if err != nil {
+			return nil, err
+		}
+		t, err := template.New(page).Funcs(funcMap).Parse(layoutStr)
+		if err != nil {
+			return nil, err
+		}
+		t, err = t.Parse(string(pageBytes))
+		if err != nil {
+			return nil, err
+		}
+		templates[page] = t
+	}
+
+	return &PageHandler{
+		DB:        database,
+		Templates: templates,
+		Title:     title,
+		ReadOnly:  readOnly,
+	}, nil
+}
+
+func (h *PageHandler) render(w http.ResponseWriter, name string, data interface{}) {
+	t, ok := h.Templates[name]
+	if !ok {
+		log.Printf("Template not found: %s", name)
+		http.Error(w, "Template not found", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	pd := pageData{Title: h.Title, ReadOnly: h.ReadOnly, Data: data}
+	if err := t.ExecuteTemplate(w, name, pd); err != nil {
+		log.Printf("Template error rendering %s: %v", name, err)
+	}
+}
+
+func (h *PageHandler) Index(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	h.render(w, "index.html", nil)
+}
+
+func (h *PageHandler) VideoPage(w http.ResponseWriter, r *http.Request) {
+	hash := r.PathValue("hash")
+	video, err := h.DB.GetVideo(hash)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	h.render(w, "video.html", video)
+}
+
+func (h *PageHandler) TagsPage(w http.ResponseWriter, r *http.Request) {
+	h.render(w, "tags.html", nil)
+}
+```
+
+## templates/video.html
+
+```html
+{{template "header" .}}
+
+{{with .Data}}
+<div class="video-page">
+    <div class="video-player-container">
+        <video id="videoPlayer" controls preload="metadata" class="video-player"
+               poster="/thumbs/{{.Hash}}/{{.MainThumbFilename}}">
+            <source src="/media/{{.Hash}}" type="video/mp4">
+            Your browser does not support the video element.
+        </video>
+    </div>
+
+    <div class="video-controls-extra">
+        <a href="/media/{{.Hash}}" class="btn btn-secondary" download="{{.Filename}}"
+           title="Download or open in external player">
+            ⬇ Download / Open Externally
+        </a>
+        <button onclick="toggleThumbPicker()" class="btn btn-secondary">
+            🖼 Choose Thumbnail
+        </button>
+    </div>
+
+    <div id="thumbPicker" class="thumb-picker hidden">
+        <div class="thumb-picker-header">
+            <h3>Select Main Thumbnail</h3>
+            <button onclick="toggleThumbPicker()" class="btn btn-sm btn-secondary">&times; Close</button>
+        </div>
+        <div id="thumbPickerGrid" class="thumb-picker-grid">
+        </div>
+    </div>
+
+    <div class="video-info">
+        <!-- Title -->
+        <div class="video-title-row">
+            <h1 id="videoTitle" class="video-title">{{.DisplayName}}</h1>
+        </div>
+        {{if .Title}}
+        <div class="video-filename-hint">📄 {{.Filename}}</div>
+        {{end}}
+
+        <!-- Editable title -->
+        <div id="titleEditor" class="inline-editor hidden">
+            <input type="text" id="titleInput" value="{{.Title}}" placeholder="Enter title (leave empty to use filename)...">
+            <button onclick="saveTitle()" class="btn btn-sm btn-primary">Save</button>
+            <button onclick="cancelTitleEdit()" class="btn btn-sm btn-secondary">Cancel</button>
+        </div>
+
+        <!-- Description -->
+        <div id="descriptionDisplay" class="video-description">
+            <!-- rendered by JS from markdown -->
+        </div>
+
+        <!-- Editable description -->
+        <div id="descriptionEditor" class="inline-editor hidden">
+            <textarea id="descriptionInput" rows="6" placeholder="Enter description (Markdown supported)...">{{.Description}}</textarea>
+            <button onclick="saveDescription()" class="btn btn-sm btn-primary">Save</button>
+            <button onclick="cancelDescriptionEdit()" class="btn btn-sm btn-secondary">Cancel</button>
+        </div>
+
+        <div class="video-meta">
+            <span class="meta-item">📁 {{.Directory}}</span>
+            <span class="meta-item">⏱ {{.DurationString}}</span>
+            <span class="meta-item">📐 {{.Width}}x{{.Height}}</span>
+            <span class="meta-item">💾 {{.SizeString}}</span>
+        </div>
+
+        <div class="tag-editor">
+            <h3>Tags</h3>
+            <div id="tagContainer" class="tag-container">
+                {{$hash := .Hash}}
+                {{range .Tags}}
+                <span class="tag" data-tag="{{.}}">
+                    <a class="tag-link" href="/?search={{urlquery (print "tag:" .)}}" onclick="event.stopPropagation()">{{.}}</a>
+                    <button class="tag-remove" onclick="event.preventDefault();event.stopPropagation();removeTag('{{$hash}}', '{{.}}')">&times;</button>
+                </span>
+                {{end}}
+            </div>
+            <div id="tagInputRow" class="tag-input-row">
+                <div class="tag-input-wrap">
+                    <input type="text" id="newTagInput" placeholder="Add tags (comma separated)..." autocomplete="off">
+                </div>
+                <button onclick="addTagsToVideo()" class="btn btn-primary btn-sm">Add Tags</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="similarVideos" class="similar-videos">
+        <h3>Similar Videos</h3>
+        <div id="similarGrid" class="video-grid video-grid-small">
+        </div>
+    </div>
+</div>
+
+<script>
+    var currentHash = "{{.Hash}}";
+    var currentTags = [{{range $i, $t := .Tags}}{{if $i}},{{end}}"{{$t}}"{{end}}];
+    var currentMainThumb = {{.MainThumbIndex}};
+    var currentTitle = {{.Title | printf "%q"}};
+    var currentDescription = {{.Description | printf "%q"}};
+
+    document.addEventListener('DOMContentLoaded', function() {
+        if (currentTags.length > 0) {
+            loadSimilarVideos(currentHash, currentTags);
+        }
+        loadThumbPicker(currentHash);
+        renderDescription(currentDescription);
+        setupReadOnlyMode();
+    });
+</script>
+{{end}}
+
+{{template "footer" .}}
+```
+
+## templates/layout.html
+
+```html
+{{define "header"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body data-readonly="{{.ReadOnly}}">
+    <nav class="navbar">
+        <a href="/" class="nav-brand">📼 {{.Title}}</a>
+        <div class="nav-links">
+            <a href="/">Browse</a>
+            <a href="/tags">Tags</a>
+            {{if .ReadOnly}}<span class="readonly-badge">Read-Only</span>{{end}}
+        </div>
+    </nav>
+    <main class="container">
+{{end}}
+
+{{define "footer"}}
+    </main>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
+{{end}}
+```
+
+## static/js/app.js
+
+Add these functions and modify existing ones. I'll give the full file but highlight the key additions — the title/description editing and read-only mode:
+
+At the very top, add a read-only state variable, and add the new functions. Here's the full replacement:
+
+```javascript
+// === State ===
+var allVideos = [];
+var selectedHashes = new Set();
+var thumbCache = {};
+var thumbIntervals = {};
+var allTagNames = [];
+var isReadOnly = false;
+
+var currentPage = 1;
+var pageSize = 100;
+var sortField = 'filename';
+var sortDir = 'asc';
+
+// === API Helpers ===
+function api(url, options) {
+    options = options || {};
+    var headers = {};
+    if (options.body) {
+        headers['Content-Type'] = 'application/json';
+    }
+    return fetch(url, Object.assign({ headers: headers }, options))
+        .then(function(resp) {
+            if (!resp.ok) throw new Error('API error: ' + resp.status);
+            return resp.json();
+        });
+}
+
+function loadAllTagNames() {
+    return api('/api/tags').then(function(tags) {
+        allTagNames = (tags || []).map(function(t) { return t.name; });
+        return allTagNames;
+    }).catch(function() {
+        allTagNames = [];
+        return [];
+    });
+}
+
+function loadConfig() {
+    return api('/api/config').then(function(cfg) {
+        isReadOnly = cfg.read_only || false;
+    }).catch(function() {
+        isReadOnly = false;
+    });
+}
+
+// === Read-Only Mode ===
+function setupReadOnlyMode() {
+    isReadOnly = document.body.dataset.readonly === 'true';
+
+    if (isReadOnly) {
+        // Hide edit controls on video page
+        hideElement('titleEditor');
+        hideElement('descriptionEditor');
+        hideElement('tagInputRow');
+
+        // Remove tag delete buttons
+        var removes = document.querySelectorAll('.tag-remove');
+        removes.forEach(function(el) { el.style.display = 'none'; });
+
+        // Hide thumb picker button & bulk bar triggers
+        var thumbBtn = document.querySelector('[onclick="toggleThumbPicker()"]');
+        if (thumbBtn) thumbBtn.style.display = 'none';
+    } else {
+        // Add edit buttons for title and description
+        var titleEl = document.getElementById('videoTitle');
+        if (titleEl) {
+            var editBtn = document.createElement('button');
+            editBtn.className = 'btn btn-sm btn-secondary edit-inline-btn';
+            editBtn.textContent = '✏️';
+            editBtn.title = 'Edit title';
+            editBtn.addEventListener('click', function() { showTitleEditor(); });
+            titleEl.parentNode.appendChild(editBtn);
+        }
+
+        var descDisplay = document.getElementById('descriptionDisplay');
+        if (descDisplay) {
+            var editBtn2 = document.createElement('button');
+            editBtn2.className = 'btn btn-sm btn-secondary edit-inline-btn';
+            editBtn2.textContent = '✏️ Edit Description';
+            editBtn2.addEventListener('click', function() { showDescriptionEditor(); });
+            descDisplay.parentNode.insertBefore(editBtn2, descDisplay.nextSibling);
+        }
+    }
+}
+
+function hideElement(id) {
+    var el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+}
+
+// === Title Editing ===
+function showTitleEditor() {
+    document.getElementById('titleEditor').classList.remove('hidden');
+    document.getElementById('titleInput').focus();
+}
+
+function cancelTitleEdit() {
+    document.getElementById('titleEditor').classList.add('hidden');
+    document.getElementById('titleInput').value = currentTitle || '';
+}
+
+function saveTitle() {
+    if (typeof currentHash === 'undefined') return;
+    var input = document.getElementById('titleInput');
+    var newTitle = input.value.trim();
+
+    api('/api/videos/' + currentHash + '/title', {
+        method: 'PUT',
+        body: JSON.stringify({ title: newTitle })
+    }).then(function(video) {
+        currentTitle = video.title;
+        document.getElementById('videoTitle').textContent = video.title || video.filename;
+        document.getElementById('titleEditor').classList.add('hidden');
+
+        // Show/hide filename hint
+        var hint = document.querySelector('.video-filename-hint');
+        if (video.title) {
+            if (!hint) {
+                hint = document.createElement('div');
+                hint.className = 'video-filename-hint';
+                document.getElementById('videoTitle').parentNode.after(hint);
+            }
+            hint.textContent = '📄 ' + video.filename;
+        } else if (hint) {
+            hint.remove();
+        }
+    }).catch(function(err) {
+        alert('Error: ' + err.message);
+    });
+}
+
+// === Description Editing ===
+function showDescriptionEditor() {
+    document.getElementById('descriptionEditor').classList.remove('hidden');
+    document.getElementById('descriptionInput').focus();
+}
+
+function cancelDescriptionEdit() {
+    document.getElementById('descriptionEditor').classList.add('hidden');
+    document.getElementById('descriptionInput').value = currentDescription || '';
+}
+
+function saveDescription() {
+    if (typeof currentHash === 'undefined') return;
+    var input = document.getElementById('descriptionInput');
+    var newDesc = input.value;
+
+    api('/api/videos/' + currentHash + '/description', {
+        method: 'PUT',
+        body: JSON.stringify({ description: newDesc })
+    }).then(function(video) {
+        currentDescription = video.description;
+        renderDescription(video.description);
+        document.getElementById('descriptionEditor').classList.add('hidden');
+    }).catch(function(err) {
+        alert('Error: ' + err.message);
+    });
+}
+
+// === Simple Markdown Renderer ===
+function renderDescription(md) {
+    var container = document.getElementById('descriptionDisplay');
+    if (!container) return;
+
+    if (!md || md.trim() === '') {
+        container.innerHTML = '<div style="color:var(--text-muted);font-style:italic">No description</div>';
+        return;
+    }
+
+    container.innerHTML = simpleMarkdown(md);
+}
+
+function simpleMarkdown(text) {
+    var lines = text.split('\n');
+    var html = [];
+    var inList = false;
+    var inCode = false;
+
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+
+        // Code blocks
+        if (line.trim().startsWith('```')) {
+            if (inCode) {
+                html.push('</code></pre>');
+                inCode = false;
+            } else {
+                if (inList) { html.push('</ul>'); inList = false; }
+                html.push('<pre><code>');
+                inCode = true;
+            }
+            continue;
+        }
+        if (inCode) {
+            html.push(escapeHtml(line));
+            html.push('\n');
+            continue;
+        }
+
+        // Empty line
+        if (line.trim() === '') {
+            if (inList) { html.push('</ul>'); inList = false; }
+            continue;
+        }
+
+        // Headers
+        var headerMatch = line.match(/^(#{1,6})\s+(.*)/);
+        if (headerMatch) {
+            if (inList) { html.push('</ul>'); inList = false; }
+            var level = headerMatch[1].length;
+            html.push('<h' + level + '>' + inlineMarkdown(headerMatch[2]) + '</h' + level + '>');
+            continue;
+        }
+
+        // Unordered list
+        if (line.match(/^\s*[-*]\s+/)) {
+            if (!inList) { html.push('<ul>'); inList = true; }
+            html.push('<li>' + inlineMarkdown(line.replace(/^\s*[-*]\s+/, '')) + '</li>');
+            continue;
+        }
+
+        // Paragraph
+        if (inList) { html.push('</ul>'); inList = false; }
+        html.push('<p>' + inlineMarkdown(line) + '</p>');
+    }
+
+    if (inList) html.push('</ul>');
+    if (inCode) html.push('</code></pre>');
+
+    return html.join('\n');
+}
+
+function inlineMarkdown(text) {
+    // Escape HTML first
+    text = escapeHtml(text);
+    // Bold
+    text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    // Italic
+    text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    // Inline code
+    text = text.replace(/`(.+?)`/g, '<code>$1</code>');
+    // Links
+    text = text.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2" target="_blank">$1</a>');
+    return text;
+}
+
+// === Autocomplete Engine ===
+function setupAutocomplete(input, options) {
+    options = options || {};
+    var mode = options.mode || 'tag';
+    var container = document.createElement('div');
+    container.className = 'autocomplete-dropdown';
+    container.style.display = 'none';
+    input.parentNode.style.position = 'relative';
+    input.parentNode.appendChild(container);
+    var selectedIdx = -1;
+    var currentMatches = [];
+
+    function getEditingToken() {
+        var val = input.value;
+        var cursor = input.selectionStart || val.length;
+        if (mode === 'search') {
+            var before = val.substring(0, cursor);
+            var match = before.match(/(?:^|\s)(tag:)([^\s]*)$/i);
+            if (match) {
+                return { prefix: match[2], start: before.length - match[2].length, end: cursor };
+            }
+            return null;
+        } else {
+            var segments = [], pos = 0, parts = val.split(',');
+            for (var i = 0; i < parts.length; i++) {
+                segments.push({ text: parts[i], start: pos, end: pos + parts[i].length });
+                pos += parts[i].length + 1;
+            }
+            for (var j = 0; j < segments.length; j++) {
+                if (cursor >= segments[j].start && cursor <= segments[j].end) {
+                    var text = segments[j].text.trim();
+                    var trimStart = segments[j].start + (segments[j].text.length - segments[j].text.trimStart().length);
+                    return { prefix: text, start: trimStart, end: segments[j].end };
+                }
+            }
+            return null;
+        }
+    }
+
+    function showMatches(token) {
+        if (!token || token.prefix.length === 0) { hide(); return; }
+        var prefix = token.prefix.toLowerCase();
+        currentMatches = allTagNames.filter(function(t) {
+            return t.toLowerCase().indexOf(prefix) === 0 && t.toLowerCase() !== prefix;
+        }).slice(0, 10);
+        if (currentMatches.length === 0) { hide(); return; }
+        selectedIdx = -1;
+        container.innerHTML = '';
+        currentMatches.forEach(function(tag, idx) {
+            var item = document.createElement('div');
+            item.className = 'autocomplete-item';
+            item.textContent = tag;
+            item.addEventListener('mousedown', function(e) { e.preventDefault(); pickMatch(token, idx); });
+            container.appendChild(item);
+        });
+        container.style.display = 'block';
+    }
+
+    function pickMatch(token, idx) {
+        var tag = currentMatches[idx];
+        if (!tag) return;
+        var val = input.value;
+        if (mode === 'search') {
+            input.value = val.substring(0, token.start) + tag + val.substring(token.end);
+            var nc = token.start + tag.length;
+            input.setSelectionRange(nc, nc);
+        } else {
+            var before = val.substring(0, token.start);
+            var after = val.substring(token.end);
+            var suffix = after.length > 0 ? '' : ', ';
+            input.value = before + tag + suffix + after.trimStart();
+            var nc = token.start + tag.length + suffix.length;
+            input.setSelectionRange(nc, nc);
+        }
+        hide();
+        input.focus();
+    }
+
+    function hide() { container.style.display = 'none'; currentMatches = []; selectedIdx = -1; }
+    function highlightItem(idx) {
+        container.querySelectorAll('.autocomplete-item').forEach(function(item, i) {
+            item.classList.toggle('highlighted', i === idx);
+        });
+    }
+
+    input.addEventListener('input', function() { showMatches(getEditingToken()); });
+    input.addEventListener('keydown', function(e) {
+        if (container.style.display === 'none') return;
+        if (e.key === 'ArrowDown') { e.preventDefault(); selectedIdx = Math.min(selectedIdx + 1, currentMatches.length - 1); highlightItem(selectedIdx); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); selectedIdx = Math.max(selectedIdx - 1, 0); highlightItem(selectedIdx); }
+        else if (e.key === 'Enter' && selectedIdx >= 0) { e.preventDefault(); var t = getEditingToken(); if (t) pickMatch(t, selectedIdx); }
+        else if (e.key === 'Escape') { hide(); }
+        else if (e.key === 'Tab' && selectedIdx >= 0) { e.preventDefault(); var t = getEditingToken(); if (t) pickMatch(t, selectedIdx); }
+    });
+    input.addEventListener('blur', function() { setTimeout(hide, 150); });
+}
+
+function sanitizeTagInput(input) {
+    input.addEventListener('input', function() {
+        var val = input.value;
+        var parts = val.split(',');
+        var cleaned = parts.map(function(p) { return p.replace(/\s+/g, ''); });
+        var newVal = cleaned.join(', ');
+        if (newVal !== val) {
+            var cursor = input.selectionStart;
+            input.value = newVal;
+            input.setSelectionRange(Math.min(cursor, newVal.length), Math.min(cursor, newVal.length));
+        }
+    });
+}
+
+// === Search ===
+function doSearch() {
+    var si = document.getElementById('searchInput');
+    var val = si ? si.value.trim() : '';
+    currentPage = 1;
+    loadVideos(val || undefined);
+}
+
+function searchForTag(tag) {
+    window.location.href = '/?search=' + encodeURIComponent('tag:' + tag);
+}
+
+function clearSearch() {
+    var si = document.getElementById('searchInput');
+    if (si) si.value = '';
+    currentPage = 1;
+    loadVideos();
+}
+
+// === Sorting ===
+function setSort(field) {
+    if (sortField === field) { sortDir = sortDir === 'asc' ? 'desc' : 'asc'; }
+    else { sortField = field; sortDir = 'asc'; }
+    currentPage = 1;
+    renderVideoGrid(allVideos);
+    updateSortButtons();
+}
+
+function updateSortButtons() {
+    document.querySelectorAll('.sort-btn').forEach(function(btn) {
+        var f = btn.dataset.sort;
+        btn.classList.toggle('active', f === sortField);
+        var arrow = btn.querySelector('.sort-arrow');
+        if (arrow) arrow.textContent = f === sortField ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    });
+}
+
+function sortVideos(videos) {
+    var sorted = videos.slice();
+    sorted.sort(function(a, b) {
+        var va, vb;
+        switch (sortField) {
+            case 'hash': va = a.hash; vb = b.hash; break;
+            case 'filename': va = (a.title || a.filename || '').toLowerCase(); vb = (b.title || b.filename || '').toLowerCase(); break;
+            case 'path': va = (a.path || '').toLowerCase(); vb = (b.path || '').toLowerCase(); break;
+            case 'added': va = a.added_at || ''; vb = b.added_at || ''; break;
+            case 'modified': va = a.modified_at || ''; vb = b.modified_at || ''; break;
+            case 'duration': va = a.duration || 0; vb = b.duration || 0; break;
+            case 'size': va = a.size || 0; vb = b.size || 0; break;
+            default: va = (a.title || a.filename || '').toLowerCase(); vb = (b.title || b.filename || '').toLowerCase();
+        }
+        var cmp = typeof va === 'number' ? va - vb : (va < vb ? -1 : va > vb ? 1 : 0);
+        return sortDir === 'desc' ? -cmp : cmp;
+    });
+    return sorted;
+}
+
+// === Pagination ===
+function setPageSize(size) { pageSize = size; currentPage = 1; renderVideoGrid(allVideos); updatePageSizeButtons(); }
+function updatePageSizeButtons() {
+    document.querySelectorAll('.pagesize-btn').forEach(function(btn) {
+        btn.classList.toggle('active', parseInt(btn.dataset.size) === pageSize);
+    });
+}
+function goToPage(page) {
+    var tp = Math.ceil(allVideos.length / pageSize);
+    currentPage = Math.max(1, Math.min(page, tp));
+    renderVideoGrid(allVideos);
+    var grid = document.getElementById('videoGrid');
+    if (grid) grid.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function renderPagination(total) {
+    var container = document.getElementById('pagination');
+    if (!container) return;
+    var tp = Math.ceil(total / pageSize);
+    if (tp <= 1) { container.innerHTML = ''; return; }
+    container.innerHTML = '';
+
+    var prev = document.createElement('button');
+    prev.className = 'btn btn-sm btn-secondary'; prev.textContent = '← Prev';
+    prev.disabled = currentPage <= 1;
+    prev.addEventListener('click', function() { goToPage(currentPage - 1); });
+    container.appendChild(prev);
+
+    var max = 7, start = Math.max(1, currentPage - Math.floor(max / 2));
+    var end = Math.min(tp, start + max - 1);
+    if (end - start < max - 1) start = Math.max(1, end - max + 1);
+
+    if (start > 1) { appendPageBtn(container, 1); if (start > 2) appendDots(container); }
+    for (var i = start; i <= end; i++) appendPageBtn(container, i);
+    if (end < tp) { if (end < tp - 1) appendDots(container); appendPageBtn(container, tp); }
+
+    var next = document.createElement('button');
+    next.className = 'btn btn-sm btn-secondary'; next.textContent = 'Next →';
+    next.disabled = currentPage >= tp;
+    next.addEventListener('click', function() { goToPage(currentPage + 1); });
+    container.appendChild(next);
+}
+
+function appendPageBtn(c, p) {
+    var b = document.createElement('button');
+    b.className = 'btn btn-sm ' + (p === currentPage ? 'btn-primary' : 'btn-secondary');
+    b.textContent = p;
+    b.addEventListener('click', function() { goToPage(p); });
+    c.appendChild(b);
+}
+function appendDots(c) {
+    var s = document.createElement('span');
+    s.className = 'page-dots'; s.textContent = '…';
+    c.appendChild(s);
+}
+
+// === Video Loading ===
+function loadVideos(searchQuery) {
+    var grid = document.getElementById('videoGrid');
+    if (!grid) return;
+    grid.innerHTML = '<div class="loading">Loading videos</div>';
+    var url = '/api/videos';
+    if (searchQuery) url += '?search=' + encodeURIComponent(searchQuery);
+    api(url).then(function(data) { allVideos = data || []; renderVideoGrid(allVideos); })
+    .catch(function(err) {
+        grid.innerHTML = '<div style="text-align:center;padding:3rem;color:#aaa">Error: ' + escapeHtml(err.message) + '</div>';
+    });
+}
+
+function getDisplayName(v) {
+    return v.title || v.filename || '';
+}
+
+function renderVideoGrid(videos) {
+    var grid = document.getElementById('videoGrid');
+    if (!grid) return;
+    Object.keys(thumbIntervals).forEach(function(h) { clearInterval(thumbIntervals[h]); });
+    thumbIntervals = {};
+    var countDiv = document.getElementById('resultCount');
+    if (!videos || videos.length === 0) {
+        if (countDiv) countDiv.textContent = '';
+        grid.innerHTML = '<div style="text-align:center;padding:3rem;color:#aaa">No videos found</div>';
+        var pag = document.getElementById('pagination'); if (pag) pag.innerHTML = '';
+        return;
+    }
+    var sorted = sortVideos(videos);
+    var tp = Math.ceil(sorted.length / pageSize);
+    if (currentPage > tp) currentPage = tp;
+    if (currentPage < 1) currentPage = 1;
+    var si = (currentPage - 1) * pageSize;
+    var pv = sorted.slice(si, si + pageSize);
+    if (countDiv) countDiv.textContent = (si + 1) + '–' + Math.min(si + pageSize, sorted.length) + ' of ' + sorted.length + ' videos';
+    grid.innerHTML = '';
+
+    pv.forEach(function(v) {
+        var card = document.createElement('div');
+        card.className = 'video-card' + (selectedHashes.has(v.hash) ? ' selected' : '');
+        card.id = 'card-' + v.hash;
+        var hasThumb = v.thumb_count && v.thumb_count > 0;
+        var mainIdx = (v.main_thumb >= 0 && v.main_thumb < v.thumb_count) ? v.main_thumb : 0;
+        var thumbUrl = hasThumb ? '/thumbs/' + v.hash + '/thumb_' + String(mainIdx).padStart(2, '0') + '.jpg' : '';
+        var displayName = getDisplayName(v);
+
+        var tagsHtml = '';
+        if (v.tags && v.tags.length > 0) {
+            tagsHtml = '<div class="card-tags">' + v.tags.slice(0, 5).map(function(t) {
+                return '<span class="mini-tag clickable-tag" data-tag="' + escapeHtml(t) + '">' + escapeHtml(t) + '</span>';
+            }).join('') + '</div>';
+        }
+
+        card.innerHTML =
+            '<input type="checkbox" class="select-checkbox" ' + (selectedHashes.has(v.hash) ? 'checked' : '') + '>' +
+            '<div class="thumb-container">' +
+                (hasThumb ? '<img id="thumb-' + v.hash + '" src="' + thumbUrl + '" alt="" loading="lazy">' :
+                    '<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#666">No thumbnail</div>') +
+                '<span class="duration-badge">' + formatDuration(v.duration) + '</span>' +
+            '</div>' +
+            '<div class="card-body">' +
+                '<div class="card-title" title="' + escapeHtml(displayName) + '">' + escapeHtml(displayName) + '</div>' +
+                '<div class="card-meta">' + escapeHtml(v.directory) + '</div>' +
+                tagsHtml +
+            '</div>';
+
+        card.querySelector('.select-checkbox').addEventListener('click', function(e) { e.stopPropagation(); toggleSelect(v.hash); });
+        var tc = card.querySelector('.thumb-container');
+        setupThumbInteraction(tc, v.hash, thumbUrl);
+        var ct = card.querySelector('.card-title');
+        if (ct) { ct.style.cursor = 'pointer'; ct.addEventListener('click', function() { window.location.href = '/video/' + v.hash; }); }
+        var cm = card.querySelector('.card-meta');
+        if (cm) { cm.style.cursor = 'pointer'; cm.addEventListener('click', function() { window.location.href = '/video/' + v.hash; }); }
+        card.querySelectorAll('.clickable-tag').forEach(function(el) {
+            el.addEventListener('click', function(e) { e.stopPropagation(); searchForTag(el.dataset.tag); });
+        });
+        grid.appendChild(card);
+    });
+
+    renderPagination(sorted.length);
+    updateSortButtons();
+    updatePageSizeButtons();
+}
+
+// === Thumbnail Interaction ===
+function setupThumbInteraction(tc, hash, defaultThumb) {
+    var cycling = false;
+    tc.addEventListener('mouseenter', function() { if (!cycling) { cycling = true; startThumbCycleOnce(hash, function() { cycling = false; }); } });
+    tc.addEventListener('mouseleave', function() { forceStopThumbCycle(hash, defaultThumb); cycling = false; });
+    tc.addEventListener('click', function() { if (!tc._touchScrolled) window.location.href = '/video/' + hash; tc._touchScrolled = false; });
+    var tsx = 0, tsy = 0; tc._touchScrolled = false; tc._touchCycled = false;
+    tc.addEventListener('touchstart', function(e) { tsx = e.touches[0].clientX; tsy = e.touches[0].clientY; tc._touchScrolled = false; }, { passive: true });
+    tc.addEventListener('touchmove', function(e) { if (Math.abs(e.touches[0].clientX - tsx) > 10 || Math.abs(e.touches[0].clientY - tsy) > 10) tc._touchScrolled = true; }, { passive: true });
+    tc.addEventListener('touchend', function(e) {
+        if (tc._touchScrolled) { if (!cycling) { cycling = true; startThumbCycleOnce(hash, function() { cycling = false; resetThumb(hash, defaultThumb); }); } return; }
+        if (tc._touchCycled) { tc._touchCycled = false; window.location.href = '/video/' + hash; }
+        else { tc._touchCycled = true; if (!cycling) { cycling = true; startThumbCycleOnce(hash, function() { cycling = false; tc._touchCycled = false; resetThumb(hash, defaultThumb); }); } setTimeout(function() { tc._touchCycled = false; }, 3000); }
+        e.preventDefault();
+    });
+}
+
+function loadThumbs(hash) {
+    if (thumbCache[hash]) return Promise.resolve(thumbCache[hash]);
+    return api('/api/thumbs/' + hash).then(function(t) { thumbCache[hash] = t || []; return thumbCache[hash]; }).catch(function() { thumbCache[hash] = []; return []; });
+}
+
+function startThumbCycleOnce(hash, onComplete) {
+    loadThumbs(hash).then(function(thumbs) {
+        if (thumbs.length <= 1) { if (onComplete) onComplete(); return; }
+        var img = document.getElementById('thumb-' + hash);
+        if (!img) { if (onComplete) onComplete(); return; }
+        forceStopThumbCycle(hash);
+        var idx = 0, shown = 0, count = thumbs.length;
+        thumbIntervals[hash] = setInterval(function() {
+            idx = (idx + 1) % count; img.src = thumbs[idx]; shown++;
+            if (shown >= count) { clearInterval(thumbIntervals[hash]); delete thumbIntervals[hash]; if (onComplete) onComplete(); }
+        }, 400);
+    });
+}
+
+function forceStopThumbCycle(hash, dt) { if (thumbIntervals[hash]) { clearInterval(thumbIntervals[hash]); delete thumbIntervals[hash]; } if (dt) resetThumb(hash, dt); }
+function resetThumb(hash, dt) { var img = document.getElementById('thumb-' + hash); if (img && dt) img.src = dt; }
+
+// === Selection & Bulk ===
+function toggleSelect(hash) {
+    var card = document.getElementById('card-' + hash);
+    var cb = card ? card.querySelector('.select-checkbox') : null;
+    if (selectedHashes.has(hash)) { selectedHashes.delete(hash); if (card) card.classList.remove('selected'); if (cb) cb.checked = false; }
+    else { selectedHashes.add(hash); if (card) card.classList.add('selected'); if (cb) cb.checked = true; }
+    updateBulkBar();
+}
+function selectAll() { allVideos.forEach(function(v) { if (!selectedHashes.has(v.hash)) { selectedHashes.add(v.hash); var c = document.getElementById('card-' + v.hash); if (c) { c.classList.add('selected'); var cb = c.querySelector('.select-checkbox'); if (cb) cb.checked = true; } } }); updateBulkBar(); }
+function selectPage() { var s = sortVideos(allVideos), si = (currentPage-1)*pageSize; s.slice(si, si+pageSize).forEach(function(v) { if (!selectedHashes.has(v.hash)) { selectedHashes.add(v.hash); var c = document.getElementById('card-'+v.hash); if(c){c.classList.add('selected'); var cb=c.querySelector('.select-checkbox'); if(cb) cb.checked=true;} } }); updateBulkBar(); }
+function updateBulkBar() {
+    var bar = document.getElementById('bulkBar'), count = document.getElementById('selectedCount');
+    if (!bar || !count) return;
+    count.textContent = selectedHashes.size;
+    if (selectedHashes.size > 0 && !isReadOnly) bar.classList.remove('hidden'); else bar.classList.add('hidden');
+}
+function clearSelection() { selectedHashes.forEach(function(h) { var c = document.getElementById('card-'+h); if(c){c.classList.remove('selected'); var cb=c.querySelector('.select-checkbox'); if(cb) cb.checked=false;} }); selectedHashes.clear(); updateBulkBar(); }
+
+function bulkAddTags() {
+    var input = document.getElementById('bulkTagInput'); if (!input) return;
+    var tags = input.value.split(',').map(function(t){return t.trim().replace(/\s+/g,'');}).filter(function(t){return t;});
+    if (tags.length === 0 || selectedHashes.size === 0) return;
+    api('/api/bulk/tags', { method: 'POST', body: JSON.stringify({ hashes: Array.from(selectedHashes), tags: tags, action: 'add' }) })
+    .then(function() { input.value = ''; clearSelection(); loadAllTagNames(); doSearch(); })
+    .catch(function(err) { alert('Error: ' + err.message); });
+}
+function bulkRemoveTags() {
+    var input = document.getElementById('bulkTagInput'); if (!input) return;
+    var tags = input.value.split(',').map(function(t){return t.trim().replace(/\s+/g,'');}).filter(function(t){return t;});
+    if (tags.length === 0 || selectedHashes.size === 0) return;
+    api('/api/bulk/tags', { method: 'POST', body: JSON.stringify({ hashes: Array.from(selectedHashes), tags: tags, action: 'remove' }) })
+    .then(function() { input.value = ''; clearSelection(); loadAllTagNames(); doSearch(); })
+    .catch(function(err) { alert('Error: ' + err.message); });
+}
+
+// === Single Video Tags ===
+function addTagsToVideo() {
+    if (typeof currentHash === 'undefined' || !currentHash) return;
+    var input = document.getElementById('newTagInput'); if (!input) return;
+    var tags = input.value.split(',').map(function(t){return t.trim().replace(/\s+/g,'');}).filter(function(t){return t;});
+    if (tags.length === 0) return;
+    api('/api/videos/'+currentHash+'/tags', { method:'POST', body:JSON.stringify({tags:tags}) })
+    .then(function(v) { input.value=''; renderTagContainer(v.tags||[]); loadAllTagNames(); })
+    .catch(function(err) { alert('Error: '+err.message); });
+}
+function removeTag(hash, tag) {
+    api('/api/videos/'+hash+'/tags', { method:'DELETE', body:JSON.stringify({tags:[tag]}) })
+    .then(function(v) { renderTagContainer(v.tags||[]); loadAllTagNames(); })
+    .catch(function(err) { alert('Error: '+err.message); });
+}
+function renderTagContainer(tags) {
+    var container = document.getElementById('tagContainer');
+    if (!container || typeof currentHash === 'undefined') return;
+    container.innerHTML = '';
+    tags.forEach(function(t) {
+        var span = document.createElement('span'); span.className = 'tag'; span.dataset.tag = t;
+        var link = document.createElement('a'); link.className = 'tag-link';
+        link.href = '/?search=' + encodeURIComponent('tag:' + t); link.textContent = t;
+        link.addEventListener('click', function(e) { e.stopPropagation(); });
+        span.appendChild(link);
+        if (!isReadOnly) {
+            var btn = document.createElement('button'); btn.className = 'tag-remove'; btn.innerHTML = '&times;';
+            btn.addEventListener('click', function(e) { e.preventDefault(); e.stopPropagation(); removeTag(currentHash, t); });
+            span.appendChild(btn);
+        }
+        container.appendChild(span);
+    });
+    if (tags.length > 0) loadSimilarVideos(currentHash, tags);
+    else { var g = document.getElementById('similarGrid'); if (g) g.innerHTML = '<div style="color:var(--text-muted)">Add tags to see similar videos</div>'; }
+}
+
+// === Thumb Picker ===
+function toggleThumbPicker() { var p = document.getElementById('thumbPicker'); if (p) p.classList.toggle('hidden'); }
+function loadThumbPicker(hash) {
+    var grid = document.getElementById('thumbPickerGrid'); if (!grid) return;
+    loadThumbs(hash).then(function(thumbs) {
+        if (!thumbs || thumbs.length === 0) { grid.innerHTML = '<div style="color:var(--text-muted)">No thumbnails</div>'; return; }
+        grid.innerHTML = '';
+        thumbs.forEach(function(url, idx) {
+            var item = document.createElement('div');
+            item.className = 'thumb-picker-item' + (idx === currentMainThumb ? ' selected' : '');
+            item.innerHTML = '<img src="'+url+'" alt="Thumb '+idx+'"><span class="thumb-index">#'+idx+'</span>';
+            item.addEventListener('click', function() { setMainThumb(hash, idx); });
+            grid.appendChild(item);
+        });
+    });
+}
+function setMainThumb(hash, index) {
+    api('/api/videos/'+hash+'/main-thumb', { method:'PUT', body:JSON.stringify({index:index}) })
+    .then(function() {
+        currentMainThumb = index;
+        document.querySelectorAll('.thumb-picker-item').forEach(function(item,idx) { item.classList.toggle('selected', idx===index); });
+        var p = document.getElementById('videoPlayer');
+        if (p) p.poster = '/thumbs/'+hash+'/thumb_'+String(index).padStart(2,'0')+'.jpg';
+    }).catch(function(err) { alert('Error: '+err.message); });
+}
+
+// === Similar Videos ===
+function loadSimilarVideos(hash, tags) {
+    var grid = document.getElementById('similarGrid'); if (!grid || !tags || tags.length === 0) return;
+    grid.innerHTML = '<div class="loading">Finding similar</div>';
+    var q = tags.map(function(t) { return 'tag:'+t; }).join(' OR ');
+    api('/api/videos?search='+encodeURIComponent(q)).then(function(videos) {
+        if (!videos) videos = [];
+        var scored = [];
+        videos.forEach(function(v) { if (v.hash===hash) return; var s=0; if(v.tags) v.tags.forEach(function(vt){if(tags.indexOf(vt)>=0)s++;}); scored.push({video:v,score:s}); });
+        scored.sort(function(a,b){return b.score-a.score;});
+        renderSimilarVideos(grid, scored.slice(0,12).map(function(s){return s.video;}));
+    }).catch(function() { grid.innerHTML = '<div style="color:var(--text-muted)">Could not load similar videos</div>'; });
+}
+function renderSimilarVideos(grid, similar) {
+    if (similar.length === 0) { grid.innerHTML = '<div style="color:var(--text-muted)">No similar videos found</div>'; return; }
+    grid.innerHTML = '';
+    similar.forEach(function(v) {
+        var hasThumb = v.thumb_count && v.thumb_count > 0;
+        var mainIdx = (v.main_thumb >= 0 && v.main_thumb < v.thumb_count) ? v.main_thumb : 0;
+        var thumbUrl = hasThumb ? '/thumbs/'+v.hash+'/thumb_'+String(mainIdx).padStart(2,'0')+'.jpg' : '';
+        var card = document.createElement('div'); card.className = 'video-card'; card.style.cursor = 'pointer';
+        card.addEventListener('click', function() { window.location.href = '/video/'+v.hash; });
+        card.innerHTML = '<div class="thumb-container">'+(hasThumb?'<img src="'+thumbUrl+'" alt="" loading="lazy">':'<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#666">No thumb</div>')+'<span class="duration-badge">'+formatDuration(v.duration)+'</span></div><div class="card-body"><div class="card-title">'+escapeHtml(getDisplayName(v))+'</div></div>';
+        grid.appendChild(card);
+    });
+}
+
+// === Tags Page ===
+function loadTagList() {
+    var c = document.getElementById('tagList'); if (!c) return;
+    api('/api/tags').then(function(tags) {
+        if (!tags||tags.length===0) { c.innerHTML='<div style="text-align:center;padding:3rem;color:#aaa">No tags yet</div>'; return; }
+        c.innerHTML = '';
+        tags.forEach(function(t) {
+            var a = document.createElement('a'); a.href = '/?search='+encodeURIComponent('tag:'+t.name);
+            a.className = 'tag-item'; a.innerHTML = escapeHtml(t.name)+' <span class="tag-count">'+t.count+'</span>';
+            c.appendChild(a);
+        });
+    }).catch(function() { c.innerHTML='<div style="text-align:center;padding:3rem;color:#aaa">Error loading tags</div>'; });
+}
+
+// === Utilities ===
+function formatDuration(s) { if(!s||s<=0) return '--:--'; var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=Math.floor(s%60); return h>0?h+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0'):m+':'+String(sec).padStart(2,'0'); }
+function escapeHtml(str) { if(!str) return ''; var d=document.createElement('div'); d.textContent=str; return d.innerHTML; }
+
+// === Init ===
+document.addEventListener('DOMContentLoaded', function() {
+    isReadOnly = document.body.dataset.readonly === 'true';
+
+    loadAllTagNames().then(function() {
+        var si = document.getElementById('searchInput');
+        if (si) { setupAutocomplete(si, {mode:'search'}); si.addEventListener('keyup', function(e){if(e.key==='Enter')doSearch();}); }
+        var bi = document.getElementById('bulkTagInput');
+        if (bi) { setupAutocomplete(bi, {mode:'tag'}); sanitizeTagInput(bi); }
+        var ni = document.getElementById('newTagInput');
+        if (ni) { setupAutocomplete(ni, {mode:'tag'}); sanitizeTagInput(ni); ni.addEventListener('keyup', function(e){if(e.key==='Enter')addTagsToVideo();}); }
+    });
+
+    if (window.location.pathname === '/') {
+        var params = new URLSearchParams(window.location.search);
+        var sp = params.get('search');
+        var si = document.getElementById('searchInput');
+        if (sp) { if (si) si.value = sp; loadVideos(sp); } else { loadVideos(); }
+    }
+});
+```
+
+## static/css/style.css
+
+Append these:
+
+```css
+/* Title/Description editing */
+.video-title-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.edit-inline-btn {
+    opacity: 0.5;
+    font-size: 0.8rem;
+    padding: 0.2rem 0.5rem;
+}
+
+.edit-inline-btn:hover {
+    opacity: 1;
+}
+
+.video-filename-hint {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-bottom: 0.5rem;
+}
+
+.inline-editor {
+    margin: 0.5rem 0;
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-start;
+}
+
+.inline-editor.hidden {
+    display: none;
+}
+
+.inline-editor input,
+.inline-editor textarea {
+    flex: 1;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 0.9rem;
+    font-family: inherit;
+}
+
+.inline-editor textarea {
+    resize: vertical;
+    min-height: 100px;
+}
+
+/* Description rendered markdown */
+.video-description {
+    margin: 0.75rem 0;
+    padding: 0.75rem 1rem;
+    background: var(--bg-card);
+    border-radius: 6px;
+    font-size: 0.9rem;
+    line-height: 1.7;
+}
+
+.video-description h1,
+.video-description h2,
+.video-description h3 {
+    margin: 0.5rem 0 0.25rem;
+}
+
+.video-description p {
+    margin: 0.4rem 0;
+}
+
+.video-description ul {
+    margin: 0.3rem 0;
+    padding-left: 1.5rem;
+}
+
+.video-description pre {
+    background: var(--bg-input);
+    padding: 0.5rem;
+    border-radius: 4px;
+    overflow-x: auto;
+}
+
+.video-description code {
+    background: var(--bg-input);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-family: monospace;
+    font-size: 0.85em;
+}
+
+.video-description pre code {
+    background: none;
+    padding: 0;
+}
+
+/* Read-only badge */
+.readonly-badge {
+    background: var(--accent);
+    color: white;
+    font-size: 0.7rem;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 600;
+}
+```
+
+## main.go
+
+Add the `--readonly` flag to serve, the `title` and `description` commands, the new API routes, and update `NewAPIHandler`/`NewPageHandler` calls:
+
+Replace the full file. Key changes: `cmdServe` gets `-readonly`, new `cmdTitle` and `cmdDescription`, updated `startServer`:
+
+```go
+package main
+
+import (
+	"bufio"
+	"embed"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io/fs"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"videolib/db"
+	"videolib/handlers"
+	"videolib/hasher"
+	"videolib/models"
+	"videolib/scanner"
+)
+
+//go:embed templates/*.html
+var templateFS embed.FS
+
+//go:embed static/*
+var staticFS embed.FS
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `Usage: videolib <command> [options] [arguments]
+
+Commands:
+  serve        Start the web server
+  scan         Add videos to the database
+  scrub        Remove stale database entries and orphaned thumbnails
+  list         Export video database in JSON or text format
+  tags         Add or remove tags for videos
+  hash         Compute content hash of files
+  title        Set video title
+  description  Set video description
+
+Run 'videolib <command> -help' for command-specific options.
+`)
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(1)
+	}
+	command := os.Args[1]
+	if command == "-help" || command == "--help" || command == "-h" {
+		usage()
+		os.Exit(0)
+	}
+	switch command {
+	case "serve":
+		cmdServe(os.Args[2:])
+	case "scan":
+		cmdScan(os.Args[2:])
+	case "scrub":
+		cmdScrub(os.Args[2:])
+	case "list":
+		cmdList(os.Args[2:])
+	case "tags":
+		cmdTags(os.Args[2:])
+	case "hash":
+		cmdHash(os.Args[2:])
+	case "title":
+		cmdTitle(os.Args[2:])
+	case "description":
+		cmdDescription(os.Args[2:])
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
+		usage()
+		os.Exit(1)
+	}
+}
+
+// === serve ===
+
+func cmdServe(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: videolib serve [options]\n\nOptions:\n")
+		fs.PrintDefaults()
+	}
+	dbPath := fs.String("db", "videolib.db", "Database file path")
+	thumbDir := fs.String("thumbs", "thumbnails", "Thumbnail directory")
+	addr := fs.String("addr", ":8080", "Listen address")
+	title := fs.String("title", "Video Library", "Web application title")
+	readOnly := fs.Bool("readonly", false, "Read-only mode (disable all editing)")
+	fs.Parse(args)
+
+	database, err := db.Open(*dbPath)
+	if err != nil {
+		log.Fatalf("Cannot open database: %v", err)
+	}
+	defer database.Close()
+
+	if *readOnly {
+		log.Println("Starting in READ-ONLY mode")
+	}
+
+	startServer(*addr, database, *thumbDir, *title, *readOnly)
+}
+
+// === scan ===
+
+func cmdScan(args []string) {
+	fs := flag.NewFlagSet("scan", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: videolib scan [options] <path> [<path> ...]\n\nOptions:\n")
+		fs.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nDefault video extensions: %s\n", defaultExtList())
+	}
+	dbPath := fs.String("db", "videolib.db", "Database file path")
+	thumbDir := fs.String("thumbs", "thumbnails", "Thumbnail directory")
+	extList := fs.String("ext", "", "Override video extensions (comma-separated)")
+	addExt := fs.String("add-ext", "", "Add extra extensions to defaults (comma-separated)")
+	fs.Parse(args)
+	paths := fs.Args()
+	if len(paths) == 0 { fs.Usage(); os.Exit(1) }
+	os.MkdirAll(*thumbDir, 0755)
+	database, err := db.Open(*dbPath)
+	if err != nil { log.Fatalf("Cannot open database: %v", err) }
+	defer database.Close()
+	var overrideExts, extraExts []string
+	if *extList != "" { overrideExts = strings.Split(*extList, ",") }
+	if *addExt != "" { extraExts = strings.Split(*addExt, ",") }
+	var tA, tU, tS, tE int
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil { log.Printf("Cannot access %s: %v", path, err); tE++; continue }
+		if !info.IsDir() && strings.HasSuffix(strings.ToLower(path), ".json") {
+			a, u, s := importJSON(database, path); tA += a; tU += u; tS += s; continue
+		}
+		var s *scanner.Scanner
+		if info.IsDir() {
+			s = scanner.New(database, []string{filepath.Clean(path)}, *thumbDir)
+		} else {
+			s = scanner.New(database, []string{filepath.Dir(filepath.Clean(path))}, *thumbDir)
+			s.SetFileFilter(filepath.Base(path))
+		}
+		if len(overrideExts) > 0 { s.SetExtensions(overrideExts) }
+		if len(extraExts) > 0 { s.AddExtensions(extraExts) }
+		result, err := s.Scan()
+		if err != nil { log.Printf("Scan error for %s: %v", path, err); tE++; continue }
+		tA += result.Added; tU += result.Updated; tS += result.Skipped; tE += result.Errors
+		log.Printf("Scanned %s: %d added, %d updated, %d skipped, %d errors", path, result.Added, result.Updated, result.Skipped, result.Errors)
+	}
+	log.Printf("Scan complete: %d added, %d updated, %d skipped, %d errors", tA, tU, tS, tE)
+}
+
+func importJSON(database *db.Database, path string) (int, int, int) {
+	log.Printf("Importing JSON: %s", path)
+	jsonBytes, err := os.ReadFile(path)
+	if err != nil { log.Printf("Cannot read %s: %v", path, err); return 0, 0, 0 }
+	var data models.ExportData
+	if err := json.Unmarshal(jsonBytes, &data); err != nil { log.Printf("Invalid JSON: %v", err); return 0, 0, 0 }
+	a, u, s, _ := database.Import(&data)
+	log.Printf("Imported %s: %d added, %d updated, %d skipped", path, a, u, s)
+	return a, u, s
+}
+
+func defaultExtList() string {
+	var exts []string
+	for ext := range scanner.DefaultVideoExtensions { exts = append(exts, ext) }
+	sort.Strings(exts)
+	return strings.Join(exts, ", ")
+}
+
+// === scrub ===
+
+func cmdScrub(args []string) {
+	fs := flag.NewFlagSet("scrub", flag.ExitOnError)
+	fs.Usage = func() { fmt.Fprintf(os.Stderr, "Usage: videolib scrub [options]\n\nOptions:\n"); fs.PrintDefaults() }
+	dbPath := fs.String("db", "videolib.db", "Database file path")
+	thumbDir := fs.String("thumbs", "thumbnails", "Thumbnail directory")
+	noVideos := fs.Bool("no-videos", false, "Skip removing stale database entries")
+	noThumbs := fs.Bool("no-thumbs", false, "Skip removing orphaned thumbnails")
+	dryRun := fs.Bool("dry-run", false, "Show what would be done without making changes")
+	fs.Parse(args)
+	database, err := db.Open(*dbPath)
+	if err != nil { log.Fatalf("Cannot open database: %v", err) }
+	defer database.Close()
+	if !*noVideos { scrubVideos(database, *dryRun) }
+	if !*noThumbs { scrubThumbnails(database, *thumbDir, *dryRun) }
+}
+
+func scrubVideos(database *db.Database, dryRun bool) {
+	log.Println("Checking for stale database entries...")
+	paths, _ := database.GetAllPaths()
+	var removed int
+	for path, hash := range paths {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if dryRun { log.Printf("[DRY RUN] Would remove: %s", path); removed++ } else {
+				log.Printf("Removing: %s", path); database.DeleteVideo(hash); removed++
+			}
+		}
+	}
+	if dryRun { log.Printf("Dry run: %d stale entries", removed) } else { log.Printf("Removed %d stale entries", removed) }
+}
+
+func scrubThumbnails(database *db.Database, thumbDir string, dryRun bool) {
+	log.Println("Checking for orphaned thumbnails...")
+	hashes, _ := database.GetAllHashes()
+	entries, err := os.ReadDir(thumbDir)
+	if err != nil { return }
+	var removed int
+	for _, e := range entries {
+		if !e.IsDir() { continue }
+		if !hashes[e.Name()] {
+			dir := filepath.Join(thumbDir, e.Name())
+			if dryRun { log.Printf("[DRY RUN] Would remove: %s", dir); removed++ } else {
+				log.Printf("Removing: %s", dir); os.RemoveAll(dir); removed++
+			}
+		}
+	}
+	if dryRun { log.Printf("Dry run: %d orphaned dirs", removed) } else { log.Printf("Removed %d orphaned dirs", removed) }
+}
+
+// === list ===
+
+func cmdList(args []string) {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	fs.Usage = func() { fmt.Fprintf(os.Stderr, "Usage: videolib list [options] [search query]\n\nOptions:\n"); fs.PrintDefaults() }
+	dbPath := fs.String("db", "videolib.db", "Database file path")
+	format := fs.String("format", "text", "Output format: json, text")
+	output := fs.String("output", "-", "Output file (- for stdout)")
+	fs.Parse(args)
+	search := strings.Join(fs.Args(), " ")
+	database, err := db.Open(*dbPath)
+	if err != nil { log.Fatalf("Cannot open database: %v", err) }
+	defer database.Close()
+	var videos []*models.Video
+	if search != "" { videos, err = database.SearchByQuery(search) } else { videos, err = database.ListAllVideos() }
+	if err != nil { log.Fatalf("Error: %v", err) }
+	var w *os.File
+	if *output == "-" { w = os.Stdout } else { w, _ = os.Create(*output); defer w.Close() }
+	switch *format {
+	case "json":
+		enc := json.NewEncoder(w); enc.SetIndent("", "  ")
+		enc.Encode(&models.ExportData{Version: 1, Exported: time.Now().UTC().Format(time.RFC3339), Videos: videos})
+	case "text":
+		for _, v := range videos {
+			tags := strings.Join(v.Tags, ","); if tags == "" { tags = "-" }
+			fmt.Fprintf(w, "%s\t%s\t%s\n", v.Hash, tags, v.Path)
+		}
+	default:
+		log.Fatalf("Unknown format: %s", *format)
+	}
+	if *output != "-" { log.Printf("Written %d videos to %s", len(videos), *output) }
+}
+
+// === tags ===
+
+type stringSlice []string
+func (s *stringSlice) String() string { return strings.Join(*s, ", ") }
+func (s *stringSlice) Set(v string) error {
+	v = strings.ToLower(strings.TrimSpace(v)); v = strings.ReplaceAll(v, " ", "")
+	if v == "" { return fmt.Errorf("empty tag") }
+	*s = append(*s, v); return nil
+}
+
+func cmdTags(args []string) {
+	fs := flag.NewFlagSet("tags", flag.ExitOnError)
+	fs.Usage = func() { fmt.Fprintf(os.Stderr, "Usage: videolib tags [options] [<hash> ...]\n\nOptions:\n"); fs.PrintDefaults() }
+	dbPath := fs.String("db", "videolib.db", "Database file path")
+	var addTags, removeTags stringSlice
+	fs.Var(&addTags, "add", "Tag to add (repeatable)")
+	fs.Var(&removeTags, "remove", "Tag to remove (repeatable)")
+	fs.Parse(args)
+	if len(addTags) == 0 && len(removeTags) == 0 { fs.Usage(); os.Exit(1) }
+	database, err := db.Open(*dbPath)
+	if err != nil { log.Fatalf("Cannot open database: %v", err) }
+	defer database.Close()
+	var hashInputs []string
+	if fs.NArg() > 0 { hashInputs = fs.Args() } else { hashInputs = readHashesFromStdin() }
+	if len(hashInputs) == 0 { log.Fatalf("No hashes provided") }
+	var hashes []string
+	for _, h := range hashInputs { r, err := resolveHash(database, h); if err != nil { log.Printf("Warning: %v", err); continue }; hashes = append(hashes, r) }
+	if len(hashes) == 0 { log.Fatalf("No valid videos found") }
+	log.Printf("Applying to %d video(s)...", len(hashes))
+	if len(removeTags) > 0 { database.BulkRemoveTags(hashes, []string(removeTags)); log.Printf("Removed: %s", strings.Join(removeTags, ", ")) }
+	if len(addTags) > 0 { database.BulkAddTags(hashes, []string(addTags)); log.Printf("Added: %s", strings.Join(addTags, ", ")) }
+	for _, h := range hashes { v, _ := database.GetVideo(h); tags := strings.Join(v.Tags, ","); if tags == "" { tags = "-" }; fmt.Printf("%s\t%s\t%s\n", v.Hash, tags, v.Path) }
+}
+
+// === title ===
+
+func cmdTitle(args []string) {
+	fs := flag.NewFlagSet("title", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: videolib title [options] <hash> [title text]
+
+Set or clear the title of a video. If no title text is given and -file
+is not specified, the title is cleared.
+
+Options:
+`)
+		fs.PrintDefaults()
+	}
+	dbPath := fs.String("db", "videolib.db", "Database file path")
+	fromFile := fs.String("file", "", "Read title from file")
+	fs.Parse(args)
+
+	if fs.NArg() < 1 { fs.Usage(); os.Exit(1) }
+	hashPrefix := fs.Arg(0)
+
+	database, err := db.Open(*dbPath)
+	if err != nil { log.Fatalf("Cannot open database: %v", err) }
+	defer database.Close()
+
+	hash, err := resolveHash(database, hashPrefix)
+	if err != nil { log.Fatalf("Error: %v", err) }
+
+	var title string
+	if *fromFile != "" {
+		data, err := os.ReadFile(*fromFile)
+		if err != nil { log.Fatalf("Cannot read file: %v", err) }
+		title = strings.TrimSpace(string(data))
+	} else if fs.NArg() > 1 {
+		title = strings.Join(fs.Args()[1:], " ")
+	}
+
+	if err := database.SetTitle(hash, title); err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+
+	v, _ := database.GetVideo(hash)
+	if v.Title != "" {
+		fmt.Printf("%s\ttitle: %s\t%s\n", v.Hash, v.Title, v.Path)
+	} else {
+		fmt.Printf("%s\ttitle: (cleared)\t%s\n", v.Hash, v.Path)
+	}
+}
+
+// === description ===
+
+func cmdDescription(args []string) {
+	fs := flag.NewFlagSet("description", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: videolib description [options] <hash> [description text]
+
+Set or clear the description of a video. Use -file to read from a file
+(useful for markdown content). If no text is given and -file is not
+specified, the description is cleared.
+
+Options:
+`)
+		fs.PrintDefaults()
+	}
+	dbPath := fs.String("db", "videolib.db", "Database file path")
+	fromFile := fs.String("file", "", "Read description from file (supports markdown)")
+	fs.Parse(args)
+
+	if fs.NArg() < 1 { fs.Usage(); os.Exit(1) }
+	hashPrefix := fs.Arg(0)
+
+	database, err := db.Open(*dbPath)
+	if err != nil { log.Fatalf("Cannot open database: %v", err) }
+	defer database.Close()
+
+	hash, err := resolveHash(database, hashPrefix)
+	if err != nil { log.Fatalf("Error: %v", err) }
+
+	var desc string
+	if *fromFile != "" {
+		data, err := os.ReadFile(*fromFile)
+		if err != nil { log.Fatalf("Cannot read file: %v", err) }
+		desc = string(data)
+	} else if fs.NArg() > 1 {
+		desc = strings.Join(fs.Args()[1:], " ")
+	}
+
+	if err := database.SetDescription(hash, desc); err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+
+	v, _ := database.GetVideo(hash)
+	if v.Description != "" {
+		lines := strings.Count(v.Description, "\n") + 1
+		fmt.Printf("%s\tdescription: %d lines\t%s\n", v.Hash, lines, v.Path)
+	} else {
+		fmt.Printf("%s\tdescription: (cleared)\t%s\n", v.Hash, v.Path)
+	}
+}
+
+// === hash ===
+
+func cmdHash(args []string) {
+	fs := flag.NewFlagSet("hash", flag.ExitOnError)
+	fs.Usage = func() { fmt.Fprintf(os.Stderr, "Usage: videolib hash [<file> ...]\n\n"); fs.PrintDefaults() }
+	fs.Parse(args)
+	var files []string
+	if fs.NArg() > 0 { files = fs.Args() } else {
+		s := bufio.NewScanner(os.Stdin)
+		for s.Scan() { l := strings.TrimSpace(s.Text()); if l != "" { files = append(files, l) } }
+	}
+	if len(files) == 0 { fs.Usage(); os.Exit(1) }
+	for _, f := range files {
+		h, err := hasher.HashFile(f)
+		if err != nil { fmt.Println("NOTFOUND") } else { fmt.Println(h) }
+	}
+}
+
+// === helpers ===
+
+func readHashesFromStdin() []string {
+	var hashes []string
+	s := bufio.NewScanner(os.Stdin)
+	for s.Scan() { l := strings.TrimSpace(s.Text()); if l != "" { f := strings.Fields(l); if len(f) > 0 { hashes = append(hashes, f[0]) } } }
+	return hashes
+}
+
+func resolveHash(database *db.Database, prefix string) (string, error) {
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	if len(prefix) < 8 { return "", fmt.Errorf("hash prefix too short: %s", prefix) }
+	if _, err := database.GetVideo(prefix); err == nil { return prefix, nil }
+	all, err := database.GetAllHashes()
+	if err != nil { return "", err }
+	var matches []string
+	for h := range all { if strings.HasPrefix(h, prefix) { matches = append(matches, h) } }
+	switch len(matches) {
+	case 0: return "", fmt.Errorf("not found: %s", prefix)
+	case 1: return matches[0], nil
+	default: return "", fmt.Errorf("ambiguous prefix '%s' (%d matches)", prefix, len(matches))
+	}
+}
+
+// === web server ===
+
+func startServer(addr string, database *db.Database, thumbDir, title string, readOnly bool) {
+	mux := http.NewServeMux()
+
+	apiHandler := handlers.NewAPIHandler(database, readOnly)
+	mux.HandleFunc("GET /api/config", apiHandler.GetConfig)
+	mux.HandleFunc("GET /api/videos", apiHandler.ListVideos)
+	mux.HandleFunc("GET /api/videos/{hash}", apiHandler.GetVideo)
+	mux.HandleFunc("POST /api/videos/{hash}/tags", apiHandler.AddTags)
+	mux.HandleFunc("PUT /api/videos/{hash}/tags", apiHandler.SetTags)
+	mux.HandleFunc("DELETE /api/videos/{hash}/tags", apiHandler.RemoveTags)
+	mux.HandleFunc("PUT /api/videos/{hash}/main-thumb", apiHandler.SetMainThumb)
+	mux.HandleFunc("PUT /api/videos/{hash}/title", apiHandler.SetTitle)
+	mux.HandleFunc("PUT /api/videos/{hash}/description", apiHandler.SetDescription)
+	mux.HandleFunc("POST /api/bulk/tags", apiHandler.BulkTags)
+	mux.HandleFunc("GET /api/tags", apiHandler.ListTags)
+
+	thumbListHandler := &handlers.ThumbListHandler{ThumbDir: thumbDir}
+	mux.Handle("GET /api/thumbs/{hash}", thumbListHandler)
+	mux.Handle("GET /media/{hash}", handlers.NewVideoFileHandler(database))
+	mux.Handle("GET /thumbs/{hash}/{filename}", handlers.NewThumbHandler(thumbDir))
+
+	staticSub, err := fs.Sub(staticFS, "static")
+	if err != nil { log.Fatalf("Static FS error: %v", err) }
+	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticSub))))
+
+	templateSub, err := fs.Sub(templateFS, "templates")
+	if err != nil { log.Fatalf("Template FS error: %v", err) }
+	pageHandler, err := handlers.NewPageHandler(database, templateSub, title, readOnly)
+	if err != nil { log.Fatalf("Template error: %v", err) }
+	mux.HandleFunc("GET /video/{hash}", pageHandler.VideoPage)
+	mux.HandleFunc("GET /tags", pageHandler.TagsPage)
+	mux.HandleFunc("GET /", pageHandler.Index)
+
+	log.Printf("Starting '%s' on %s", title, addr)
+	if readOnly { log.Println("Read-only mode: editing disabled") }
+	if err := http.ListenAndServe(addr, mux); err != nil { log.Fatalf("Server error: %v", err) }
+}
+```
+
+Summary of all changes:
+
+| Feature | Implementation |
+|---------|---------------|
+| **Title field** | `title TEXT` column in videos; `SetTitle()` in DB; `PUT /api/videos/{hash}/title` endpoint; `DisplayName()` method returns title or filename |
+| **Description field** | `description TEXT` column; `SetDescription()` in DB; `PUT /api/videos/{hash}/description`; rendered as markdown in frontend |
+| **Markdown renderer** | Client-side `simpleMarkdown()`: headers, bold, italic, code, links, lists, code blocks |
+| **Schema migration** | `addColumnIfMissing()` adds title/description columns when upgrading existing DBs |
+| **FTS includes title** | `videos_fts` virtual table now indexes title, so text search matches titles too |
+| **JSON export/import** | Title and description included; import merges (only overwrites if target is empty) |
+| **Read-only mode** | `-readonly` flag on serve; `data-readonly` on `<body>`; `checkWritable()` guard on all write APIs; frontend hides edit UI, tag delete buttons, bulk bar |
+| **`title` command** | `videolib title <hash> My Title` or `videolib title -file title.txt <hash>` or empty to clear |
+| **`description` command** | `videolib description <hash> text` or `videolib description -file desc.md <hash>` |
+| **Display name in grid** | Cards show title if set, filename otherwise; sort by "Name" uses display name |
+
+USER: update the README.md accordingly
+
+ASSISTANT: 
+
+## README.md
+
+```markdown
+# videolib
+
+A self-contained video library server with tagging, search, and thumbnail previews. Scans directories for video files, extracts metadata via ffprobe, generates thumbnail strips, and serves a responsive web UI for browsing, searching, and tagging your collection. All data is stored in a local SQLite database. The entire application — including HTML templates, CSS, and JavaScript — compiles into a single binary.
+
+## Building
+
+### Prerequisites
+
+- **Go 1.22+**
+- **ffmpeg/ffprobe** (for metadata extraction and thumbnail generation)
+- **GCC** or compatible C compiler (required by the SQLite driver)
+
+```bash
+# Ubuntu/Debian
+sudo apt install ffmpeg gcc
+
+# macOS
+brew install ffmpeg
+
+# Arch
+sudo pacman -S ffmpeg
+```
+
+### Compile
+
+```bash
+git clone https://github.com/youruser/videolib.git
+cd videolib
+CGO_ENABLED=1 go build -o videolib .
+```
+
+The resulting binary is fully self-contained — all static assets are embedded.
+
+### Cross-compilation
+
+Since the SQLite driver uses CGO, cross-compilation requires a C cross-compiler:
+
+```bash
+CC=x86_64-linux-musl-gcc GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -o videolib .
+```
+
+## Web Frontend
+
+The web interface is a responsive single-page application that works on desktop and mobile browsers.
+
+### Video Grid
+
+The main page displays videos in a card grid that adapts to screen size. Each card shows:
+
+- A thumbnail image (the selected main thumbnail or the first generated one)
+- Video duration badge
+- Title (or filename if no title is set)
+- Directory path
+- Up to 5 tag pills
+
+**Thumbnail preview**: Hovering over a card (desktop) or tapping it (mobile) cycles through all generated thumbnails for that video once, then stops. On desktop, moving the mouse away resets to the main thumbnail immediately. On mobile, a second tap navigates to the video page.
+
+**Tag navigation**: Clicking any tag pill in the grid navigates to a search for that tag.
+
+### Search
+
+A single unified search bar supports a rich query language:
+
+| Query | Meaning |
+|-------|---------|
+| `holiday` | Full-text search in filenames, paths, and titles |
+| `holiday*` | Prefix/truncated search |
+| `"beach party"` | Exact phrase match |
+| `tag:action` | Videos with the tag "action" |
+| `tag:genre*` | Videos with tags matching "genre..." |
+| `UNTAGGED` | Videos with no tags at all |
+| `TAGGED` | Videos with at least one tag |
+| `duration:+1:30` | Videos 90 seconds or longer |
+| `duration:-60` | Videos shorter than 60 seconds |
+| `duration:+1:00:00` | Videos 1 hour or longer |
+| `size:+100m` | Videos 100 MiB or larger |
+| `size:-1g` | Videos smaller than 1 GiB |
+| `size:+500k` | Videos 500 KiB or larger |
+| `path:videos/2024/*` | Path matching shell glob (case-sensitive, `*`, `?`, `[abc]`) |
+| `path:"my videos/*.mp4"` | Quoted glob with spaces |
+| `ipath:*.mkv` | Case-insensitive path glob |
+| `A AND B` | Both conditions must match |
+| `A OR B` | Either condition matches |
+| `NOT A` | Exclude matching videos |
+| `(A OR B) AND NOT C` | Grouping with parentheses |
+| `holiday tag:vacation` | Implicit AND between terms |
+
+Duration values accept `SS`, `MM:SS`, or `HH:MM:SS` formats. Size values accept a number with optional `k`, `m`, or `g` suffix (binary KiB/MiB/GiB). Path globs use shell-style rules: `*` matches any characters, `?` matches a single character, `[abc]` matches a character class.
+
+The search bar features **tag autocomplete** — typing `tag:` followed by characters shows a dropdown of matching existing tags, navigable with arrow keys and Tab/Enter.
+
+### Sorting and Pagination
+
+Search results can be sorted by:
+
+- **Name** — title if set, otherwise filename (default)
+- **Path** — full relative path including filename
+- **Hash** — content hash (quasi-random but stable ordering)
+- **Added** — date the video was first scanned
+- **Modified** — date of last metadata/tag change
+- **Duration** — video length
+- **Size** — file size
+
+Each sort column toggles between ascending and descending. Results are paginated with configurable page sizes of 50, 100 (default), 200, or 500 items.
+
+### Bulk Tagging
+
+Selecting one or more videos (via checkboxes) reveals a bulk action bar:
+
+1. Check individual videos, use **Select Page** to select all on the current page, or **Select All** for the entire result set
+2. Type comma-separated tags in the bulk input field (with autocomplete)
+3. Click **+ Add Tags** or **- Remove Tags** to apply
+
+This enables fast workflows like: search for `UNTAGGED`, select all, add initial tags.
+
+Tags may not contain spaces — any spaces entered are stripped automatically.
+
+### Single Video View
+
+Clicking a video opens the player page with:
+
+- **HTML5 video player** with poster image (selected thumbnail shown before playback starts)
+- **Download button** to open the video file in an external player or save it locally
+- **Thumbnail picker** — opens a grid of all generated thumbnails; click one to set it as the main thumbnail used in the grid view and as the player poster
+- **Title** — displayed prominently; when a title is set, the original filename is shown as a smaller hint below. Click the edit button to set or change the title.
+- **Description** — displayed below the title, rendered from Markdown. Supports headings, bold, italic, inline code, code blocks, lists, and links. Click the edit button to modify.
+- **Tag editor** — view, add, and remove tags; each tag is a clickable link that searches for other videos with the same tag
+- **Similar videos** — automatically shown based on shared tags, ranked by number of tags in common
+
+### Tags Page
+
+A dedicated page lists all tags with usage counts. Clicking a tag navigates to the search results for that tag.
+
+### Read-Only Mode
+
+Starting the server with `-readonly` disables all editing in the web interface:
+
+- Tag add/remove buttons and bulk tagging are hidden
+- Title and description edit buttons are hidden
+- Thumbnail picker is hidden
+- All write API endpoints return 403 Forbidden
+- A "Read-Only" badge appears in the navigation bar
+
+This is useful for sharing the library with others without allowing modifications.
+
+## Command Line
+
+```
+videolib <command> [options] [arguments]
+```
+
+### `serve` — Start the web server
+
+```
+videolib serve [options]
+```
+
+Starts the HTTP server. Video file paths are read from the database, so no directory arguments are needed.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-db` | `videolib.db` | Database file path |
+| `-thumbs` | `thumbnails` | Thumbnail directory |
+| `-addr` | `:8080` | Listen address |
+| `-title` | `Video Library` | Web application title shown in the navbar and browser tab |
+| `-readonly` | `false` | Read-only mode — disables all editing |
+
+**Examples:**
+
+```bash
+# Start on default port
+videolib serve
+
+# Custom port and title
+videolib serve -addr :9090 -title "My Movies"
+
+# Read-only sharing
+videolib serve -readonly -title "Movie Archive"
+
+# Use a specific database
+videolib serve -db /data/videos.db -thumbs /data/thumbs
+```
+
+### `scan` — Add videos to the database
+
+```
+videolib scan [options] <path> [<path> ...]
+```
+
+Each path can be:
+
+- **A directory** — scanned recursively for video files
+- **A single video file** — added directly
+- **A JSON file** — previously exported with `videolib list -format json`, imported with tag, title, and description merging
+
+When scanning encounters a file whose content hash already exists in the database (e.g., a renamed or moved file), the database entry is updated to the new path while **preserving all tags, thumbnails, title, description, and the selected main thumbnail**.
+
+Scanning does **not** remove entries for files that no longer exist — use `videolib scrub` for that.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-db` | `videolib.db` | Database file path |
+| `-thumbs` | `thumbnails` | Thumbnail directory |
+| `-ext` | *(built-in list)* | Override video extensions (comma-separated) |
+| `-add-ext` | *(none)* | Add extra extensions to the defaults |
+
+Default extensions: `.3gp`, `.avi`, `.divx`, `.flv`, `.m4v`, `.mkv`, `.mov`, `.mp4`, `.mpeg`, `.mpg`, `.ogv`, `.rm`, `.rmvb`, `.ts`, `.vob`, `.webm`, `.wmv`
+
+**Examples:**
+
+```bash
+# Scan a directory
+videolib scan ./videos
+
+# Scan multiple directories
+videolib scan ./movies ./series ./downloads
+
+# Scan a single file
+videolib scan ./new-video.mp4
+
+# Import a previously exported JSON (includes tags, titles, descriptions)
+videolib scan backup.json
+
+# Mix directories, files, and imports
+videolib scan ./new-videos clip.mp4 old-tags.json
+
+# Add support for extra file types
+videolib scan -add-ext mts,m2ts ./camera-footage
+
+# Only scan specific formats
+videolib scan -ext mp4,mkv ./videos
+```
+
+### `scrub` — Clean up stale entries
+
+```
+videolib scrub [options]
+```
+
+Performs two cleanup operations in order:
+
+1. **Database scrub**: Removes entries for video files that no longer exist on disk
+2. **Thumbnail scrub**: Removes thumbnail directories that have no matching database entry
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-db` | `videolib.db` | Database file path |
+| `-thumbs` | `thumbnails` | Thumbnail directory |
+| `-no-videos` | `false` | Skip removing stale database entries |
+| `-no-thumbs` | `false` | Skip removing orphaned thumbnails |
+| `-dry-run` | `false` | Show what would be done without making changes |
+
+**Examples:**
+
+```bash
+# Full cleanup
+videolib scrub
+
+# Preview what would be removed
+videolib scrub -dry-run
+
+# Only clean database, keep orphaned thumbnails
+videolib scrub -no-thumbs
+
+# Only clean thumbnails, keep stale database entries
+videolib scrub -no-videos
+```
+
+### `list` — Export video data
+
+```
+videolib list [options] [search query]
+```
+
+Outputs video data in two formats. The optional search query uses the same syntax as the web frontend.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-db` | `videolib.db` | Database file path |
+| `-format` | `text` | Output format: `json` or `text` |
+| `-output` | `-` (stdout) | Output file path |
+
+**Text format** outputs one line per video:
+
+```
+HASH<tab>TAGS<tab>PATH
+```
+
+Tags are comma-separated with no spaces. Videos with no tags show `-`. The text format always shows the file path (not the title) for scripting compatibility.
+
+**JSON format** outputs a full export including tags, titles, and descriptions. This can be re-imported with `videolib scan`.
+
+**Examples:**
+
+```bash
+# List all videos
+videolib list
+
+# Search and list
+videolib list tag:action
+videolib list UNTAGGED
+videolib list "duration:+1:00:00 AND size:+1g"
+videolib list 'ipath:*/comedy/*'
+videolib list '"beach party"'
+
+# Export to JSON (importable backup with titles and descriptions)
+videolib list -format json -output backup.json
+
+# Export search results
+videolib list -format json -output action.json tag:action
+
+# Count videos matching a query
+videolib list tag:action | wc -l
+
+# Get just the paths
+videolib list | cut -f3
+
+# Get just the hashes
+videolib list UNTAGGED | cut -f1
+```
+
+### `tags` — Modify tags from the command line
+
+```
+videolib tags [options] [<hash> ...]
+```
+
+Adds or removes tags for videos identified by hash. Hash arguments can be prefixes (minimum 8 characters). If no hash arguments are given, hashes are read from stdin — compatible with the text output of `videolib list`.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-db` | `videolib.db` | Database file path |
+| `-add` | *(none)* | Tag to add (repeatable) |
+| `-remove` | *(none)* | Tag to remove (repeatable) |
+
+**Examples:**
+
+```bash
+# Tag a single video
+videolib tags -add action -add favorite abc123de
+
+# Remove a tag
+videolib tags -remove boring abc123de
+
+# Multiple operations on multiple videos
+videolib tags -add reviewed -remove needs-review abc123de def456ab
+
+# Tag all untagged videos
+videolib list UNTAGGED | videolib tags -add needs-review
+
+# Tag search results
+videolib list 'ipath:*/comedy/*' | videolib tags -add genre:comedy
+
+# Remove a tag from everything that has it
+videolib list tag:old-name | videolib tags -remove old-name -add new-name
+
+# Tag all short videos
+videolib list 'duration:-60' | videolib tags -add short
+
+# Tag large files
+videolib list 'size:+2g' | videolib tags -add large-file
+```
+
+### `title` — Set video title
+
+```
+videolib title [options] <hash> [title text]
+```
+
+Sets or clears the title of a video. When a title is set, it is displayed instead of the filename in the web frontend. Full-text search also matches against titles.
+
+If no title text is given and `-file` is not specified, the title is cleared.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-db` | `videolib.db` | Database file path |
+| `-file` | *(none)* | Read title from a file |
+
+**Examples:**
+
+```bash
+# Set a title
+videolib title abc123de "My Vacation Video"
+
+# Set title from a file
+videolib title -file title.txt abc123de
+
+# Clear a title (reverts to showing filename)
+videolib title abc123de
+
+# Use hash prefix
+videolib title abc123 "Short Title"
+```
+
+### `description` — Set video description
+
+```
+videolib description [options] <hash> [description text]
+```
+
+Sets or clears the description of a video. Descriptions are rendered as Markdown in the web frontend, supporting headings, bold, italic, code, lists, and links. For multi-line content, use `-file`.
+
+If no text is given and `-file` is not specified, the description is cleared.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-db` | `videolib.db` | Database file path |
+| `-file` | *(none)* | Read description from a file (supports Markdown) |
+
+**Examples:**
+
+```bash
+# Set a simple description
+videolib description abc123de "A fun day at the beach"
+
+# Set description from a markdown file
+videolib description -file notes.md abc123de
+
+# Clear a description
+videolib description abc123de
+
+# Pipe content
+echo "# Chapter 1\nThe adventure begins..." > desc.md
+videolib description -file desc.md abc123de
+```
+
+### `hash` — Compute file content hashes
+
+```
+videolib hash [<file> ...]
+```
+
+Computes the same content hash used internally to identify videos (SHA-256 of the first 10 MB plus file size). If no filenames are given, reads filenames from stdin (one per line). Outputs one hash per line. Prints `NOTFOUND` for files that don't exist or can't be read.
+
+**Examples:**
+
+```bash
+# Hash a single file
+videolib hash video.mp4
+
+# Hash multiple files
+videolib hash *.mp4 *.mkv
+
+# Hash from a file list
+find /videos -name '*.mp4' | videolib hash
+
+# Check if files match known hashes
+videolib hash video.mp4
+# compare with:
+videolib list -format text | grep -F "$(videolib hash video.mp4)"
+
+# Hash all paths from the database (verify integrity)
+videolib list | cut -f3 | videolib hash
+```
+
+## Typical Workflows
+
+### Initial setup
+
+```bash
+# Scan your video directories
+videolib scan ./videos ./more-videos
+
+# Start the server
+videolib serve -title "My Library"
+# Open http://localhost:8080
+```
+
+### Ongoing maintenance
+
+```bash
+# Add newly downloaded videos
+videolib scan ./downloads
+
+# Clean up after deleting files
+videolib scrub
+
+# Backup your tags, titles, and descriptions
+videolib list -format json -output backup.json
+
+# Restore on another machine
+videolib scan backup.json
+videolib scan /path/to/same/videos
+```
+
+### Batch tagging from the command line
+
+```bash
+# Tag everything in a directory
+videolib list 'ipath:videos/action/*' | videolib tags -add genre:action
+
+# Find and tag unreviewed content
+videolib list UNTAGGED | videolib tags -add needs-review
+
+# Rename a tag across the whole library
+videolib list tag:old-tag | videolib tags -remove old-tag -add new-tag
+```
+
+### Setting titles and descriptions
+
+```bash
+# Set a title
+videolib title abc123de "Summer Vacation 2024"
+
+# Write a markdown description
+cat > desc.md << 'EOF'
+# Summer Vacation
+
+Our trip to the **Italian coast**.
+
+## Highlights
+- Swimming at the beach
+- Visiting the old town
+- Amazing sunset views
+
+*Filmed with GoPro Hero 12*
+EOF
+
+videolib description -file desc.md abc123de
+```
+
+### Sharing as read-only
+
+```bash
+# Start in read-only mode for sharing
+videolib serve -readonly -addr :8080 -title "Movie Collection"
+```
+
+## File Identification
+
+Videos are identified by a SHA-256 hash of the first 10 MB of file content combined with the total file size. This means:
+
+- **Renaming or moving** a file preserves its identity — tags, titles, descriptions, and thumbnails follow automatically on the next scan
+- **Duplicate files** (identical content) share the same hash — the database tracks the most recently scanned path
+- Files that differ only after the first 10 MB but have different total sizes are distinguished correctly
+
+## Data Portability
+
+The JSON export format (`videolib list -format json`) captures all metadata:
+
+- File path, size, duration, dimensions
+- Tags
+- Title and description
+- Selected main thumbnail index
+- Timestamps (added, modified)
+
+This file can be imported on another machine with `videolib scan backup.json`. On import:
+
+- New videos (by hash) are added with all metadata
+- Existing videos get tags merged (union), and title/description filled in only if currently empty
+- The video files themselves are not included — they must be present on disk and scanned separately
+
+## License
+
+MIT
+```
+
 Conversation settings
 title: Building a Video Library
 model-name: Anthropic Claude Opus 4.6 (External)

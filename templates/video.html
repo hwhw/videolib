@@ -30,7 +30,33 @@
     </div>
 
     <div class="video-info">
-        <h1 class="video-title">{{.Filename}}</h1>
+        <!-- Title -->
+        <div class="video-title-row">
+            <h1 id="videoTitle" class="video-title">{{.DisplayName}}</h1>
+        </div>
+        {{if .Title}}
+        <div class="video-filename-hint">📄 {{.Filename}}</div>
+        {{end}}
+
+        <!-- Editable title -->
+        <div id="titleEditor" class="inline-editor hidden">
+            <input type="text" id="titleInput" value="{{.Title}}" placeholder="Enter title (leave empty to use filename)...">
+            <button onclick="saveTitle()" class="btn btn-sm btn-primary">Save</button>
+            <button onclick="cancelTitleEdit()" class="btn btn-sm btn-secondary">Cancel</button>
+        </div>
+
+        <!-- Description -->
+        <div id="descriptionDisplay" class="video-description">
+            <!-- rendered by JS from markdown -->
+        </div>
+
+        <!-- Editable description -->
+        <div id="descriptionEditor" class="inline-editor hidden">
+            <textarea id="descriptionInput" rows="6" placeholder="Enter description (Markdown supported)...">{{.Description}}</textarea>
+            <button onclick="saveDescription()" class="btn btn-sm btn-primary">Save</button>
+            <button onclick="cancelDescriptionEdit()" class="btn btn-sm btn-secondary">Cancel</button>
+        </div>
+
         <div class="video-meta">
             <span class="meta-item">📁 {{.Directory}}</span>
             <span class="meta-item">⏱ {{.DurationString}}</span>
@@ -49,7 +75,7 @@
                 </span>
                 {{end}}
             </div>
-            <div class="tag-input-row">
+            <div id="tagInputRow" class="tag-input-row">
                 <div class="tag-input-wrap">
                     <input type="text" id="newTagInput" placeholder="Add tags (comma separated)..." autocomplete="off">
                 </div>
@@ -69,12 +95,16 @@
     var currentHash = "{{.Hash}}";
     var currentTags = [{{range $i, $t := .Tags}}{{if $i}},{{end}}"{{$t}}"{{end}}];
     var currentMainThumb = {{.MainThumbIndex}};
+    var currentTitle = {{.Title | printf "%q"}};
+    var currentDescription = {{.Description | printf "%q"}};
 
     document.addEventListener('DOMContentLoaded', function() {
         if (currentTags.length > 0) {
             loadSimilarVideos(currentHash, currentTags);
         }
         loadThumbPicker(currentHash);
+        renderDescription(currentDescription);
+        setupReadOnlyMode();
     });
 </script>
 {{end}}

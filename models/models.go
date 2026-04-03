@@ -17,9 +17,18 @@ type Video struct {
 	Tags        []string  `json:"tags"`
 	ThumbCount  int       `json:"thumb_count"`
 	MainThumb   int       `json:"main_thumb"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
 	AddedAt     time.Time `json:"added_at"`
 	ModifiedAt  time.Time `json:"modified_at"`
 	FileModTime time.Time `json:"file_mod_time"`
+}
+
+func (v *Video) DisplayName() string {
+	if v.Title != "" {
+		return v.Title
+	}
+	return v.Filename
 }
 
 func (v *Video) DurationString() string {

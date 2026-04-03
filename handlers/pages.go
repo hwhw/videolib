@@ -13,14 +13,16 @@ type PageHandler struct {
 	DB        *db.Database
 	Templates map[string]*template.Template
 	Title     string
+	ReadOnly  bool
 }
 
 type pageData struct {
-	Title string
-	Data  interface{}
+	Title    string
+	ReadOnly bool
+	Data     interface{}
 }
 
-func NewPageHandler(database *db.Database, templateFS fs.FS, title string) (*PageHandler, error) {
+func NewPageHandler(database *db.Database, templateFS fs.FS, title string, readOnly bool) (*PageHandler, error) {
 	funcMap := template.FuncMap{
 		"join": func(s []string, sep string) string {
 			result := ""
@@ -32,6 +34,7 @@ func NewPageHandler(database *db.Database, templateFS fs.FS, title string) (*Pag
 			}
 			return result
 		},
+		"urlquery": template.URLQueryEscaper,
 	}
 
 	layoutBytes, err := fs.ReadFile(templateFS, "layout.html")
@@ -48,7 +51,6 @@ func NewPageHandler(database *db.Database, templateFS fs.FS, title string) (*Pag
 		if err != nil {
 			return nil, err
 		}
-
 		t, err := template.New(page).Funcs(funcMap).Parse(layoutStr)
 		if err != nil {
 			return nil, err
@@ -64,6 +66,7 @@ func NewPageHandler(database *db.Database, templateFS fs.FS, title string) (*Pag
 		DB:        database,
 		Templates: templates,
 		Title:     title,
+		ReadOnly:  readOnly,
 	}, nil
 }
 
@@ -75,10 +78,9 @@ func (h *PageHandler) render(w http.ResponseWriter, name string, data interface{
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	pd := pageData{Title: h.Title, Data: data}
+	pd := pageData{Title: h.Title, ReadOnly: h.ReadOnly, Data: data}
 	if err := t.ExecuteTemplate(w, name, pd); err != nil {
 		log.Printf("Template error rendering %s: %v", name, err)
-		http.Error(w, "Template error", 500)
 	}
 }
 

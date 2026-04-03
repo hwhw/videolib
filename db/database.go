@@ -49,6 +49,8 @@ func (d *Database) migrate() error {
 			height INTEGER NOT NULL DEFAULT 0,
 			thumb_count INTEGER NOT NULL DEFAULT 0,
 			main_thumb INTEGER NOT NULL DEFAULT -1,
+			title TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '',
 			added_at TEXT NOT NULL,
 			modified_at TEXT NOT NULL,
 			file_mod_time TEXT NOT NULL
@@ -71,26 +73,27 @@ func (d *Database) migrate() error {
 			filename,
 			path,
 			directory,
+			title,
 			content='videos',
 			content_rowid='rowid',
 			tokenize='unicode61 remove_diacritics 2'
 		)`,
 
 		`CREATE TRIGGER IF NOT EXISTS videos_ai AFTER INSERT ON videos BEGIN
-			INSERT INTO videos_fts(rowid, hash, filename, path, directory)
-			VALUES (new.rowid, new.hash, new.filename, new.path, new.directory);
+			INSERT INTO videos_fts(rowid, hash, filename, path, directory, title)
+			VALUES (new.rowid, new.hash, new.filename, new.path, new.directory, new.title);
 		END`,
 
 		`CREATE TRIGGER IF NOT EXISTS videos_ad AFTER DELETE ON videos BEGIN
-			INSERT INTO videos_fts(videos_fts, rowid, hash, filename, path, directory)
-			VALUES ('delete', old.rowid, old.hash, old.filename, old.path, old.directory);
+			INSERT INTO videos_fts(videos_fts, rowid, hash, filename, path, directory, title)
+			VALUES ('delete', old.rowid, old.hash, old.filename, old.path, old.directory, old.title);
 		END`,
 
 		`CREATE TRIGGER IF NOT EXISTS videos_au AFTER UPDATE ON videos BEGIN
-			INSERT INTO videos_fts(videos_fts, rowid, hash, filename, path, directory)
-			VALUES ('delete', old.rowid, old.hash, old.filename, old.path, old.directory);
-			INSERT INTO videos_fts(rowid, hash, filename, path, directory)
-			VALUES (new.rowid, new.hash, new.filename, new.path, new.directory);
+			INSERT INTO videos_fts(videos_fts, rowid, hash, filename, path, directory, title)
+			VALUES ('delete', old.rowid, old.hash, old.filename, old.path, old.directory, old.title);
+			INSERT INTO videos_fts(rowid, hash, filename, path, directory, title)
+			VALUES (new.rowid, new.hash, new.filename, new.path, new.directory, new.title);
 		END`,
 	}
 
@@ -100,10 +103,29 @@ func (d *Database) migrate() error {
 		}
 	}
 
+	// Add columns if upgrading from older schema
+	d.addColumnIfMissing("videos", "title", "TEXT NOT NULL DEFAULT ''")
+	d.addColumnIfMissing("videos", "description", "TEXT NOT NULL DEFAULT ''")
+
 	return nil
 }
 
+func (d *Database) addColumnIfMissing(table, column, colDef string) {
+	var count int
+	err := d.db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+		table, column,
+	).Scan(&count)
+	if err != nil || count > 0 {
+		return
+	}
+	d.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, colDef))
+}
+
 // === Video CRUD ===
+
+const videoColumns = `hash, path, filename, directory, size, duration, width, height,
+	thumb_count, main_thumb, title, description, added_at, modified_at, file_mod_time`
 
 func (d *Database) PutVideo(v *models.Video) error {
 	tx, err := d.db.Begin()
@@ -114,16 +136,17 @@ func (d *Database) PutVideo(v *models.Video) error {
 
 	_, err = tx.Exec(`
 		INSERT INTO videos (hash, path, filename, directory, size, duration, width, height,
-			thumb_count, main_thumb, added_at, modified_at, file_mod_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			thumb_count, main_thumb, title, description, added_at, modified_at, file_mod_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(hash) DO UPDATE SET
 			path=excluded.path, filename=excluded.filename, directory=excluded.directory,
 			size=excluded.size, duration=excluded.duration, width=excluded.width, height=excluded.height,
 			thumb_count=excluded.thumb_count, main_thumb=excluded.main_thumb,
+			title=excluded.title, description=excluded.description,
 			modified_at=excluded.modified_at, file_mod_time=excluded.file_mod_time
 	`,
 		v.Hash, v.Path, v.Filename, v.Directory, v.Size, v.Duration, v.Width, v.Height,
-		v.ThumbCount, v.MainThumb,
+		v.ThumbCount, v.MainThumb, v.Title, v.Description,
 		v.AddedAt.Format(time.RFC3339), v.ModifiedAt.Format(time.RFC3339),
 		v.FileModTime.Format(time.RFC3339),
 	)
@@ -131,7 +154,6 @@ func (d *Database) PutVideo(v *models.Video) error {
 		return err
 	}
 
-	// Replace tags
 	_, err = tx.Exec("DELETE FROM tags WHERE hash = ?", v.Hash)
 	if err != nil {
 		return err
@@ -146,6 +168,7 @@ func (d *Database) PutVideo(v *models.Video) error {
 
 		for _, tag := range v.Tags {
 			tag = strings.ToLower(strings.TrimSpace(tag))
+			tag = strings.ReplaceAll(tag, " ", "")
 			if tag != "" {
 				if _, err := stmt.Exec(v.Hash, tag); err != nil {
 					return err
@@ -157,8 +180,6 @@ func (d *Database) PutVideo(v *models.Video) error {
 	return tx.Commit()
 }
 
-// UpdateVideoPath changes path/filename/directory for an existing video.
-// Preserves tags, thumbnails, main_thumb, added_at.
 func (d *Database) UpdateVideoPath(v *models.Video, oldPath string) error {
 	_, err := d.db.Exec(`
 		UPDATE videos SET
@@ -178,12 +199,12 @@ func (d *Database) GetVideo(hash string) (*models.Video, error) {
 	var addedAt, modifiedAt, fileModTime string
 
 	err := d.db.QueryRow(`
-		SELECT hash, path, filename, directory, size, duration, width, height,
-			thumb_count, main_thumb, added_at, modified_at, file_mod_time
+		SELECT `+videoColumns+`
 		FROM videos WHERE hash = ?
 	`, hash).Scan(
 		&v.Hash, &v.Path, &v.Filename, &v.Directory, &v.Size, &v.Duration,
 		&v.Width, &v.Height, &v.ThumbCount, &v.MainThumb,
+		&v.Title, &v.Description,
 		&addedAt, &modifiedAt, &fileModTime,
 	)
 	if err == sql.ErrNoRows {
@@ -208,6 +229,22 @@ func (d *Database) GetVideo(hash string) (*models.Video, error) {
 
 func (d *Database) DeleteVideo(hash string) error {
 	_, err := d.db.Exec("DELETE FROM videos WHERE hash = ?", hash)
+	return err
+}
+
+func (d *Database) SetTitle(hash string, title string) error {
+	_, err := d.db.Exec(
+		"UPDATE videos SET title = ?, modified_at = ? WHERE hash = ?",
+		title, time.Now().Format(time.RFC3339), hash,
+	)
+	return err
+}
+
+func (d *Database) SetDescription(hash string, description string) error {
+	_, err := d.db.Exec(
+		"UPDATE videos SET description = ?, modified_at = ? WHERE hash = ?",
+		description, time.Now().Format(time.RFC3339), hash,
+	)
 	return err
 }
 
@@ -255,6 +292,7 @@ func (d *Database) FullTextSearch(query string) ([]*models.Video, error) {
 	rows, err := d.db.Query(`
 		SELECT v.hash, v.path, v.filename, v.directory, v.size, v.duration,
 			v.width, v.height, v.thumb_count, v.main_thumb,
+			v.title, v.description,
 			v.added_at, v.modified_at, v.file_mod_time
 		FROM videos_fts f
 		JOIN videos v ON v.hash = f.hash
@@ -308,7 +346,6 @@ func sanitizeFTSQuery(input string) string {
 				(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' {
 				current.WriteByte(ch)
 			} else if inQuote && ch == ' ' {
-				// Allow spaces inside quotes for FTS phrase
 				current.WriteByte(' ')
 			}
 		}
@@ -327,20 +364,6 @@ func sanitizeFTSQuery(input string) string {
 
 // === Tag Query Engine ===
 
-// SearchByQuery parses and executes a structured search query.
-// Syntax:
-//   word              - FTS on filename/path (supports word* prefix)
-//   "exact phrase"    - FTS phrase search
-//   tag:value         - videos with tag exactly matching "value"
-//   tag:val*          - videos with tag matching "val%" (wildcard)
-//   duration:+1:30    - videos >= 90 seconds
-//   duration:-60      - videos < 60 seconds
-//   size:+100m        - videos >= 100 MiB
-//   size:-1g          - videos < 1 GiB
-//   UNTAGGED          - videos with no tags
-//   TAGGED            - videos with at least one tag
-//   AND, OR, NOT      - boolean operators (AND is implicit between terms)
-//   ( )               - grouping
 func (d *Database) SearchByQuery(query string) ([]*models.Video, error) {
 	tokens := tokenizeQuery(query)
 	if len(tokens) == 0 {
@@ -356,6 +379,7 @@ func (d *Database) SearchByQuery(query string) ([]*models.Video, error) {
 	sqlStr := `
 		SELECT DISTINCT v.hash, v.path, v.filename, v.directory, v.size, v.duration,
 			v.width, v.height, v.thumb_count, v.main_thumb,
+			v.title, v.description,
 			v.added_at, v.modified_at, v.file_mod_time
 		FROM videos v
 		WHERE ` + sqlWhere + `
@@ -375,12 +399,12 @@ type tokenType int
 
 const (
 	tokWord     tokenType = iota
-	tokPhrase             // "quoted phrase"
-	tokTag                // tag:value
-	tokDuration           // duration:+90 or duration:-1:30:00
-	tokSize               // size:+100m or size:-1g
-	tokPath               // path:some/glob*pattern
-	tokIPath              // ipath:some/glob*pattern (case-insensitive)
+	tokPhrase
+	tokTag
+	tokDuration
+	tokSize
+	tokPath
+	tokIPath
 	tokAnd
 	tokOr
 	tokNot
@@ -399,13 +423,10 @@ func tokenizeQuery(input string) []token {
 	i := 0
 
 	for i < len(input) {
-		// Skip whitespace
 		if input[i] == ' ' || input[i] == '\t' {
 			i++
 			continue
 		}
-
-		// Parentheses
 		if input[i] == '(' {
 			tokens = append(tokens, token{tokLParen, "("})
 			i++
@@ -416,17 +437,15 @@ func tokenizeQuery(input string) []token {
 			i++
 			continue
 		}
-
-		// Quoted phrase (standalone, not after a prefix)
 		if input[i] == '"' {
-			i++ // skip opening quote
+			i++
 			start := i
 			for i < len(input) && input[i] != '"' {
 				i++
 			}
 			phrase := input[start:i]
 			if i < len(input) {
-				i++ // skip closing quote
+				i++
 			}
 			phrase = strings.TrimSpace(phrase)
 			if phrase != "" {
@@ -435,11 +454,9 @@ func tokenizeQuery(input string) []token {
 			continue
 		}
 
-		// Read a word (until space, paren, or standalone quote)
 		start := i
 		for i < len(input) && input[i] != ' ' && input[i] != '\t' &&
 			input[i] != '(' && input[i] != ')' {
-			// If we hit a quote, it might be part of a prefix value like path:"foo bar"
 			if input[i] == '"' {
 				break
 			}
@@ -449,11 +466,8 @@ func tokenizeQuery(input string) []token {
 		word := input[start:i]
 		lower := strings.ToLower(word)
 
-		// Check if this word is a prefix that expects a value which might be quoted
-		// Prefixes: tag:, duration:, size:, path:, ipath:
 		prefixType, prefixLen := classifyPrefix(lower)
 		if prefixType != tokWord && prefixLen == len(word) {
-			// The prefix ends right at the word boundary — value follows (possibly quoted)
 			val := readPrefixValue(input, &i)
 			if val != "" {
 				switch prefixType {
@@ -472,7 +486,6 @@ func tokenizeQuery(input string) []token {
 			continue
 		}
 
-		// Prefix with inline value like tag:foo, duration:+60, path:some/dir/*
 		if prefixType != tokWord && prefixLen < len(word) {
 			val := word[prefixLen:]
 			switch prefixType {
@@ -490,7 +503,6 @@ func tokenizeQuery(input string) []token {
 			continue
 		}
 
-		// Keywords
 		upper := strings.ToUpper(word)
 		switch upper {
 		case "AND":
@@ -507,14 +519,12 @@ func tokenizeQuery(input string) []token {
 	return tokens
 }
 
-// classifyPrefix checks if a lowercase word starts with a known prefix.
-// Returns the token type and the length of the prefix (including the colon).
 func classifyPrefix(lower string) (tokenType, int) {
 	prefixes := []struct {
 		prefix string
 		typ    tokenType
 	}{
-		{"ipath:", tokIPath}, // check before "path:" since it's longer
+		{"ipath:", tokIPath},
 		{"path:", tokPath},
 		{"tag:", tokTag},
 		{"duration:", tokDuration},
@@ -528,28 +538,22 @@ func classifyPrefix(lower string) (tokenType, int) {
 	return tokWord, 0
 }
 
-// readPrefixValue reads the value after a prefix like path: which may be quoted.
-// Advances i past the value.
 func readPrefixValue(input string, i *int) string {
 	if *i >= len(input) {
 		return ""
 	}
-
-	// Quoted value
 	if input[*i] == '"' {
-		*i++ // skip opening quote
+		*i++
 		start := *i
 		for *i < len(input) && input[*i] != '"' {
 			*i++
 		}
 		val := input[start:*i]
 		if *i < len(input) {
-			*i++ // skip closing quote
+			*i++
 		}
 		return val
 	}
-
-	// Unquoted: read until space or paren
 	start := *i
 	for *i < len(input) && input[*i] != ' ' && input[*i] != '\t' &&
 		input[*i] != '(' && input[*i] != ')' {
@@ -584,23 +588,19 @@ func (p *queryParser) parseExpression() (string, []interface{}, error) {
 	if err != nil {
 		return "", nil, err
 	}
-
 	for {
 		t := p.peek()
 		if t == nil || t.typ != tokOr {
 			break
 		}
 		p.next()
-
 		right, rightArgs, err := p.parseAnd()
 		if err != nil {
 			return "", nil, err
 		}
-
 		left = "(" + left + " OR " + right + ")"
 		args = append(args, rightArgs...)
 	}
-
 	return left, args, nil
 }
 
@@ -609,33 +609,27 @@ func (p *queryParser) parseAnd() (string, []interface{}, error) {
 	if err != nil {
 		return "", nil, err
 	}
-
 	for {
 		t := p.peek()
 		if t == nil {
 			break
 		}
-
 		if t.typ == tokAnd {
 			p.next()
 		} else if t.typ == tokWord || t.typ == tokPhrase || t.typ == tokTag ||
 			t.typ == tokDuration || t.typ == tokSize ||
 			t.typ == tokPath || t.typ == tokIPath ||
 			t.typ == tokNot || t.typ == tokLParen {
-			// implicit AND
 		} else {
 			break
 		}
-
 		right, rightArgs, err := p.parseUnary()
 		if err != nil {
 			return "", nil, err
 		}
-
 		left = "(" + left + " AND " + right + ")"
 		args = append(args, rightArgs...)
 	}
-
 	return left, args, nil
 }
 
@@ -644,7 +638,6 @@ func (p *queryParser) parseUnary() (string, []interface{}, error) {
 	if t == nil {
 		return "", nil, fmt.Errorf("unexpected end of query")
 	}
-
 	if t.typ == tokNot {
 		p.next()
 		inner, args, err := p.parseUnary()
@@ -653,7 +646,6 @@ func (p *queryParser) parseUnary() (string, []interface{}, error) {
 		}
 		return "NOT (" + inner + ")", args, nil
 	}
-
 	return p.parseAtom()
 }
 
@@ -662,8 +654,6 @@ func (p *queryParser) parseAtom() (string, []interface{}, error) {
 	if t == nil {
 		return "", nil, fmt.Errorf("unexpected end of query")
 	}
-
-	// Parenthesized sub-expression
 	if t.typ == tokLParen {
 		p.next()
 		expr, args, err := p.parseExpression()
@@ -676,8 +666,6 @@ func (p *queryParser) parseAtom() (string, []interface{}, error) {
 		}
 		return expr, args, nil
 	}
-
-	// Tag search
 	if t.typ == tokTag {
 		p.next()
 		tagValue := t.val
@@ -687,32 +675,22 @@ func (p *queryParser) parseAtom() (string, []interface{}, error) {
 		}
 		return "v.hash IN (SELECT hash FROM tags WHERE tag = ?)", []interface{}{tagValue}, nil
 	}
-
-	// Duration filter
 	if t.typ == tokDuration {
 		p.next()
 		return parseDurationFilter(t.val)
 	}
-
-	// Size filter
 	if t.typ == tokSize {
 		p.next()
 		return parseSizeFilter(t.val)
 	}
-
-	// Path glob (case-sensitive)
 	if t.typ == tokPath {
 		p.next()
 		return parsePathFilter(t.val, false)
 	}
-
-	// Path glob (case-insensitive)
 	if t.typ == tokIPath {
 		p.next()
 		return parsePathFilter(t.val, true)
 	}
-
-	// Quoted phrase -> FTS phrase search
 	if t.typ == tokPhrase {
 		p.next()
 		ftsPhrase := sanitizeFTSPhrase(t.val)
@@ -722,34 +700,26 @@ func (p *queryParser) parseAtom() (string, []interface{}, error) {
 		return `v.hash IN (SELECT hash FROM videos_fts WHERE videos_fts MATCH ?)`,
 			[]interface{}{ftsPhrase}, nil
 	}
-
-	// Plain word
 	if t.typ != tokWord {
 		return "", nil, fmt.Errorf("unexpected token: %s", t.val)
 	}
 	p.next()
-
 	word := t.val
 	upper := strings.ToUpper(word)
-
 	if upper == "UNTAGGED" {
 		return "v.hash NOT IN (SELECT DISTINCT hash FROM tags)", nil, nil
 	}
-
 	if upper == "TAGGED" {
 		return "v.hash IN (SELECT DISTINCT hash FROM tags)", nil, nil
 	}
-
 	ftsWord := sanitizeFTSWord(word)
 	if ftsWord == "" {
 		return "1=1", nil, nil
 	}
-
 	return `v.hash IN (SELECT hash FROM videos_fts WHERE videos_fts MATCH ?)`,
 		[]interface{}{ftsWord}, nil
 }
 
-// sanitizeFTSWord cleans a single word for FTS5 query
 func sanitizeFTSWord(word string) string {
 	var b strings.Builder
 	for _, ch := range word {
@@ -763,7 +733,6 @@ func sanitizeFTSWord(word string) string {
 	return b.String()
 }
 
-// sanitizeFTSPhrase cleans a quoted phrase for FTS5 phrase query
 func sanitizeFTSPhrase(phrase string) string {
 	var b strings.Builder
 	b.WriteByte('"')
@@ -781,104 +750,83 @@ func sanitizeFTSPhrase(phrase string) string {
 	return result
 }
 
-// parseDurationFilter parses duration:+VALUE or duration:-VALUE
-// VALUE can be: SS, MM:SS, HH:MM:SS
 func parseDurationFilter(val string) (string, []interface{}, error) {
 	if len(val) < 2 {
-		return "", nil, fmt.Errorf("invalid duration filter: %s (need + or - prefix)", val)
+		return "", nil, fmt.Errorf("invalid duration filter: %s", val)
 	}
-
 	op := val[0]
 	if op != '+' && op != '-' {
 		return "", nil, fmt.Errorf("invalid duration filter: %s (need + or - prefix)", val)
 	}
-
 	seconds, err := parseDurationValue(val[1:])
 	if err != nil {
 		return "", nil, fmt.Errorf("invalid duration filter: %s: %w", val, err)
 	}
-
 	if op == '+' {
 		return "v.duration >= ?", []interface{}{seconds}, nil
 	}
 	return "v.duration < ?", []interface{}{seconds}, nil
 }
 
-// parseDurationValue parses SS, MM:SS, or HH:MM:SS into total seconds
 func parseDurationValue(s string) (float64, error) {
 	parts := strings.Split(s, ":")
-
 	switch len(parts) {
 	case 1:
-		// Just seconds
 		return strconv.ParseFloat(parts[0], 64)
-
 	case 2:
-		// MM:SS
 		mins, err := strconv.ParseFloat(parts[0], 64)
 		if err != nil {
-			return 0, fmt.Errorf("invalid minutes: %s", parts[0])
+			return 0, err
 		}
 		secs, err := strconv.ParseFloat(parts[1], 64)
 		if err != nil {
-			return 0, fmt.Errorf("invalid seconds: %s", parts[1])
+			return 0, err
 		}
 		return mins*60 + secs, nil
-
 	case 3:
-		// HH:MM:SS
 		hours, err := strconv.ParseFloat(parts[0], 64)
 		if err != nil {
-			return 0, fmt.Errorf("invalid hours: %s", parts[0])
+			return 0, err
 		}
 		mins, err := strconv.ParseFloat(parts[1], 64)
 		if err != nil {
-			return 0, fmt.Errorf("invalid minutes: %s", parts[1])
+			return 0, err
 		}
 		secs, err := strconv.ParseFloat(parts[2], 64)
 		if err != nil {
-			return 0, fmt.Errorf("invalid seconds: %s", parts[2])
+			return 0, err
 		}
 		return hours*3600 + mins*60 + secs, nil
-
 	default:
-		return 0, fmt.Errorf("invalid duration format: %s (use SS, MM:SS, or HH:MM:SS)", s)
+		return 0, fmt.Errorf("invalid duration format: %s", s)
 	}
 }
 
-// parseSizeFilter parses size:+VALUE or size:-VALUE
-// VALUE can be a number with optional suffix: k, m, g (binary: KiB, MiB, GiB)
 func parseSizeFilter(val string) (string, []interface{}, error) {
 	if len(val) < 2 {
-		return "", nil, fmt.Errorf("invalid size filter: %s (need + or - prefix)", val)
+		return "", nil, fmt.Errorf("invalid size filter: %s", val)
 	}
-
 	op := val[0]
 	if op != '+' && op != '-' {
 		return "", nil, fmt.Errorf("invalid size filter: %s (need + or - prefix)", val)
 	}
-
 	bytes, err := parseSizeValue(val[1:])
 	if err != nil {
 		return "", nil, fmt.Errorf("invalid size filter: %s: %w", val, err)
 	}
-
 	if op == '+' {
 		return "v.size >= ?", []interface{}{bytes}, nil
 	}
 	return "v.size < ?", []interface{}{bytes}, nil
 }
 
-// parseSizeValue parses a number with optional k/m/g suffix
 func parseSizeValue(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, fmt.Errorf("empty size value")
 	}
-
 	var multiplier int64 = 1
 	last := strings.ToLower(s[len(s)-1:])
-
 	switch last {
 	case "k":
 		multiplier = 1024
@@ -890,40 +838,24 @@ func parseSizeValue(s string) (int64, error) {
 		multiplier = 1024 * 1024 * 1024
 		s = s[:len(s)-1]
 	}
-
 	num, err := strconv.ParseFloat(s, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid number: %s", s)
 	}
-
 	return int64(num * float64(multiplier)), nil
 }
 
-// parsePathFilter converts a shell glob pattern to a SQL GLOB or LIKE query on v.path.
-// Shell glob rules: * matches any chars, ? matches single char, [abc] matches character class.
-// SQLite GLOB uses the same rules natively, so we pass through directly.
-// For case-insensitive mode, we convert to LIKE with % and _ and lowercase both sides.
 func parsePathFilter(pattern string, caseInsensitive bool) (string, []interface{}, error) {
 	if pattern == "" {
 		return "1=1", nil, nil
 	}
-
 	if caseInsensitive {
-		// Convert glob to LIKE pattern:
-		// * -> %
-		// ? -> _
-		// Character classes [abc] are not supported in LIKE, translate to %
 		likePattern := globToLike(pattern)
 		return "LOWER(v.path) LIKE LOWER(?)", []interface{}{likePattern}, nil
 	}
-
-	// Case-sensitive: use SQLite GLOB directly
-	// SQLite GLOB is case-sensitive and uses * and ? like shell
 	return "v.path GLOB ?", []interface{}{pattern}, nil
 }
 
-// globToLike converts shell glob syntax to SQL LIKE syntax.
-// * -> %, ? -> _, [...]  -> % (simplified), literal % and _ are escaped.
 func globToLike(glob string) string {
 	var b strings.Builder
 	i := 0
@@ -935,13 +867,12 @@ func globToLike(glob string) string {
 		case '?':
 			b.WriteByte('_')
 		case '[':
-			// Skip to closing ] and replace with %
 			j := i + 1
 			for j < len(glob) && glob[j] != ']' {
 				j++
 			}
 			if j < len(glob) {
-				i = j // will be incremented below
+				i = j
 			}
 			b.WriteByte('%')
 		case '%':
@@ -966,7 +897,6 @@ func (d *Database) getVideoTags(hash string) ([]string, error) {
 		return nil, err
 	}
 	defer rows.Close()
-
 	var tags []string
 	for rows.Next() {
 		var tag string
@@ -987,29 +917,19 @@ func (d *Database) AddTags(hash string, tags []string) error {
 		return err
 	}
 	defer tx.Rollback()
-
 	stmt, err := tx.Prepare("INSERT OR IGNORE INTO tags (hash, tag) VALUES (?, ?)")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
-
 	for _, t := range tags {
 		t = strings.ToLower(strings.TrimSpace(t))
 		t = strings.ReplaceAll(t, " ", "")
 		if t != "" {
-			if _, err := stmt.Exec(hash, t); err != nil {
-				return err
-			}
+			stmt.Exec(hash, t)
 		}
 	}
-
-	_, err = tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?",
-		time.Now().Format(time.RFC3339), hash)
-	if err != nil {
-		return err
-	}
-
+	tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?", time.Now().Format(time.RFC3339), hash)
 	return tx.Commit()
 }
 
@@ -1019,35 +939,22 @@ func (d *Database) SetTags(hash string, tags []string) error {
 		return err
 	}
 	defer tx.Rollback()
-
-	if _, err := tx.Exec("DELETE FROM tags WHERE hash = ?", hash); err != nil {
-		return err
-	}
-
+	tx.Exec("DELETE FROM tags WHERE hash = ?", hash)
 	stmt, err := tx.Prepare("INSERT OR IGNORE INTO tags (hash, tag) VALUES (?, ?)")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
-
 	seen := make(map[string]bool)
 	for _, t := range tags {
 		t = strings.ToLower(strings.TrimSpace(t))
 		t = strings.ReplaceAll(t, " ", "")
 		if t != "" && !seen[t] {
 			seen[t] = true
-			if _, err := stmt.Exec(hash, t); err != nil {
-				return err
-			}
+			stmt.Exec(hash, t)
 		}
 	}
-
-	_, err = tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?",
-		time.Now().Format(time.RFC3339), hash)
-	if err != nil {
-		return err
-	}
-
+	tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?", time.Now().Format(time.RFC3339), hash)
 	return tx.Commit()
 }
 
@@ -1057,13 +964,11 @@ func (d *Database) RemoveTags(hash string, tags []string) error {
 		return err
 	}
 	defer tx.Rollback()
-
 	stmt, err := tx.Prepare("DELETE FROM tags WHERE hash = ? AND tag = ?")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
-
 	for _, t := range tags {
 		t = strings.ToLower(strings.TrimSpace(t))
 		t = strings.ReplaceAll(t, " ", "")
@@ -1071,13 +976,7 @@ func (d *Database) RemoveTags(hash string, tags []string) error {
 			stmt.Exec(hash, t)
 		}
 	}
-
-	_, err = tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?",
-		time.Now().Format(time.RFC3339), hash)
-	if err != nil {
-		return err
-	}
-
+	tx.Exec("UPDATE videos SET modified_at = ? WHERE hash = ?", time.Now().Format(time.RFC3339), hash)
 	return tx.Commit()
 }
 
@@ -1087,20 +986,14 @@ func (d *Database) BulkAddTags(hashes []string, tags []string) error {
 		return err
 	}
 	defer tx.Rollback()
-
 	stmt, err := tx.Prepare("INSERT OR IGNORE INTO tags (hash, tag) VALUES (?, ?)")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
-
 	now := time.Now().Format(time.RFC3339)
-	updateStmt, err := tx.Prepare("UPDATE videos SET modified_at = ? WHERE hash = ?")
-	if err != nil {
-		return err
-	}
-	defer updateStmt.Close()
-
+	upd, _ := tx.Prepare("UPDATE videos SET modified_at = ? WHERE hash = ?")
+	defer upd.Close()
 	for _, hash := range hashes {
 		for _, t := range tags {
 			t = strings.ToLower(strings.TrimSpace(t))
@@ -1109,9 +1002,8 @@ func (d *Database) BulkAddTags(hashes []string, tags []string) error {
 				stmt.Exec(hash, t)
 			}
 		}
-		updateStmt.Exec(now, hash)
+		upd.Exec(now, hash)
 	}
-
 	return tx.Commit()
 }
 
@@ -1121,20 +1013,14 @@ func (d *Database) BulkRemoveTags(hashes []string, tags []string) error {
 		return err
 	}
 	defer tx.Rollback()
-
 	stmt, err := tx.Prepare("DELETE FROM tags WHERE hash = ? AND tag = ?")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
-
 	now := time.Now().Format(time.RFC3339)
-	updateStmt, err := tx.Prepare("UPDATE videos SET modified_at = ? WHERE hash = ?")
-	if err != nil {
-		return err
-	}
-	defer updateStmt.Close()
-
+	upd, _ := tx.Prepare("UPDATE videos SET modified_at = ? WHERE hash = ?")
+	defer upd.Close()
 	for _, hash := range hashes {
 		for _, t := range tags {
 			t = strings.ToLower(strings.TrimSpace(t))
@@ -1143,9 +1029,8 @@ func (d *Database) BulkRemoveTags(hashes []string, tags []string) error {
 				stmt.Exec(hash, t)
 			}
 		}
-		updateStmt.Exec(now, hash)
+		upd.Exec(now, hash)
 	}
-
 	return tx.Commit()
 }
 
@@ -1161,30 +1046,22 @@ func (d *Database) SetMainThumb(hash string, thumbIndex int) error {
 
 func (d *Database) ListAllVideos() ([]*models.Video, error) {
 	rows, err := d.db.Query(`
-		SELECT hash, path, filename, directory, size, duration, width, height,
-			thumb_count, main_thumb, added_at, modified_at, file_mod_time
+		SELECT ` + videoColumns + `
 		FROM videos ORDER BY filename
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
 	return d.scanVideosWithTags(rows)
 }
 
 func (d *Database) ListAllTags() ([]models.TagInfo, error) {
-	rows, err := d.db.Query(`
-		SELECT tag, COUNT(*) as cnt
-		FROM tags
-		GROUP BY tag
-		ORDER BY tag
-	`)
+	rows, err := d.db.Query(`SELECT tag, COUNT(*) as cnt FROM tags GROUP BY tag ORDER BY tag`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
 	var tags []models.TagInfo
 	for rows.Next() {
 		var t models.TagInfo
@@ -1220,11 +1097,12 @@ func (d *Database) Import(data *models.ExportData) (added, updated, skipped int,
 			}
 			added++
 		} else {
+			changed := false
+
 			existingTags := make(map[string]bool)
 			for _, t := range existing.Tags {
 				existingTags[t] = true
 			}
-
 			var newTags []string
 			for _, t := range v.Tags {
 				t = strings.ToLower(strings.TrimSpace(t))
@@ -1232,14 +1110,20 @@ func (d *Database) Import(data *models.ExportData) (added, updated, skipped int,
 					newTags = append(newTags, t)
 				}
 			}
-
-			changed := false
 			if len(newTags) > 0 {
 				d.AddTags(existing.Hash, newTags)
 				changed = true
 			}
 			if existing.MainThumb <= 0 && v.MainThumb > 0 {
 				d.SetMainThumb(existing.Hash, v.MainThumb)
+				changed = true
+			}
+			if existing.Title == "" && v.Title != "" {
+				d.SetTitle(existing.Hash, v.Title)
+				changed = true
+			}
+			if existing.Description == "" && v.Description != "" {
+				d.SetDescription(existing.Hash, v.Description)
 				changed = true
 			}
 
@@ -1264,6 +1148,7 @@ func (d *Database) scanVideosWithTags(rows *sql.Rows) ([]*models.Video, error) {
 		err := rows.Scan(
 			&v.Hash, &v.Path, &v.Filename, &v.Directory, &v.Size, &v.Duration,
 			&v.Width, &v.Height, &v.ThumbCount, &v.MainThumb,
+			&v.Title, &v.Description,
 			&addedAt, &modifiedAt, &fileModTime,
 		)
 		if err != nil {
@@ -1279,14 +1164,11 @@ func (d *Database) scanVideosWithTags(rows *sql.Rows) ([]*models.Video, error) {
 			return nil, err
 		}
 		v.Tags = tags
-
 		videos = append(videos, v)
 	}
-
 	if videos == nil {
 		videos = []*models.Video{}
 	}
-
 	return videos, rows.Err()
 }
 
@@ -1294,7 +1176,6 @@ func (d *Database) SearchByTags(tags []string) ([]*models.Video, error) {
 	if len(tags) == 0 {
 		return d.ListAllVideos()
 	}
-
 	normalized := make([]string, 0, len(tags))
 	for _, t := range tags {
 		t = strings.ToLower(strings.TrimSpace(t))
@@ -1310,23 +1191,21 @@ func (d *Database) SearchByTags(tags []string) ([]*models.Video, error) {
 		parts = append(parts, "SELECT hash FROM tags WHERE tag = ?")
 		args = append(args, t)
 	}
-
 	hashQuery := strings.Join(parts, " INTERSECT ")
 
 	sqlStr := `
 		SELECT v.hash, v.path, v.filename, v.directory, v.size, v.duration,
 			v.width, v.height, v.thumb_count, v.main_thumb,
+			v.title, v.description,
 			v.added_at, v.modified_at, v.file_mod_time
 		FROM videos v
 		WHERE v.hash IN (` + hashQuery + `)
 		ORDER BY v.filename
 	`
-
 	rows, err := d.db.Query(sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
 	return d.scanVideosWithTags(rows)
 }
