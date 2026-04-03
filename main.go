@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -128,10 +129,13 @@ and thumbnails).
 Options:
 `)
 		fs.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nDefault video extensions: %s\n", defaultExtList())
 	}
 
 	dbPath := fs.String("db", "videolib.db", "Database file path")
 	thumbDir := fs.String("thumbs", "thumbnails", "Thumbnail directory")
+	extList := fs.String("ext", "", "Override video extensions (comma-separated, e.g. mp4,mkv,avi)")
+	addExt := fs.String("add-ext", "", "Add extra extensions to defaults (comma-separated)")
 	fs.Parse(args)
 
 	paths := fs.Args()
@@ -149,6 +153,16 @@ Options:
 		log.Fatalf("Cannot open database: %v", err)
 	}
 	defer database.Close()
+
+	// Parse extensions
+	var overrideExts []string
+	if *extList != "" {
+		overrideExts = strings.Split(*extList, ",")
+	}
+	var extraExts []string
+	if *addExt != "" {
+		extraExts = strings.Split(*addExt, ",")
+	}
 
 	var totalAdded, totalUpdated, totalSkipped, totalErrors int
 
@@ -169,9 +183,14 @@ Options:
 			continue
 		}
 
-		// Single file or directory
 		if info.IsDir() {
 			s := scanner.New(database, []string{filepath.Clean(path)}, *thumbDir)
+			if len(overrideExts) > 0 {
+				s.SetExtensions(overrideExts)
+			}
+			if len(extraExts) > 0 {
+				s.AddExtensions(extraExts)
+			}
 			result, err := s.Scan()
 			if err != nil {
 				log.Printf("Scan error for %s: %v", path, err)
@@ -185,10 +204,15 @@ Options:
 			log.Printf("Scanned %s: %d added, %d updated, %d skipped, %d errors, %d total on disk",
 				path, result.Added, result.Updated, result.Skipped, result.Errors, result.Total)
 		} else {
-			// Single video file
 			dir := filepath.Dir(filepath.Clean(path))
 			filename := filepath.Base(path)
 			s := scanner.New(database, []string{dir}, *thumbDir)
+			if len(overrideExts) > 0 {
+				s.SetExtensions(overrideExts)
+			}
+			if len(extraExts) > 0 {
+				s.AddExtensions(extraExts)
+			}
 			s.SetFileFilter(filename)
 			result, err := s.Scan()
 			if err != nil {
@@ -205,6 +229,15 @@ Options:
 
 	log.Printf("Scan complete: %d added, %d updated, %d skipped, %d errors",
 		totalAdded, totalUpdated, totalSkipped, totalErrors)
+}
+
+func defaultExtList() string {
+	var exts []string
+	for ext := range scanner.DefaultVideoExtensions {
+		exts = append(exts, ext)
+	}
+	sort.Strings(exts)
+	return strings.Join(exts, ", ")
 }
 
 func importJSON(database *db.Database, path string) (added, updated, skipped int) {

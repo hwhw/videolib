@@ -643,3 +643,224 @@ a:hover { color: var(--accent-hover); }
 .bulk-bar.hidden {
     display: none;
 }
+
+/* Controls bar (sort + page size) */
+.controls-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.sort-controls,
+.page-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+}
+
+.controls-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-right: 0.25rem;
+}
+
+.sort-btn,
+.pagesize-btn {
+    background: var(--bg-input);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    font-size: 0.78rem;
+    padding: 0.25rem 0.5rem;
+}
+
+.sort-btn:hover,
+.pagesize-btn:hover {
+    color: var(--text);
+    border-color: var(--text-muted);
+}
+
+.sort-btn.active,
+.pagesize-btn.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+}
+
+.sort-arrow {
+    font-size: 0.7rem;
+}
+
+/* Pagination */
+.pagination {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 0.3rem;
+    margin-top: 1.5rem;
+    padding: 1rem 0;
+    flex-wrap: wrap;
+}
+
+.pagination .btn {
+    min-width: 2rem;
+    text-align: center;
+}
+
+.pagination .btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.page-dots {
+    color: var(--text-muted);
+    padding: 0 0.3rem;
+}
+
+/* Clickable tags */
+.clickable-tag {
+    cursor: pointer;
+}
+
+.clickable-tag:hover {
+    background: var(--accent) !important;
+    color: white !important;
+}
+
+/* Tag links in single-video view */
+.tag-link {
+    color: var(--text);
+    text-decoration: none;
+}
+
+.tag-link:hover {
+    color: var(--accent-hover);
+}
+
+/* Autocomplete dropdown */
+.search-input-wrap,
+.tag-input-wrap,
+.bulk-tag-wrap {
+    position: relative;
+    flex: 1;
+    min-width: 200px;
+}
+
+.search-input-wrap input,
+.tag-input-wrap input,
+.bulk-tag-wrap input {
+    width: 100%;
+    padding: 0.6rem 1rem;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 0.95rem;
+}
+
+.search-input-wrap input:focus,
+.tag-input-wrap input:focus,
+.bulk-tag-wrap input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.tag-input-wrap input {
+    padding: 0.4rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.9rem;
+}
+
+.autocomplete-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-top: none;
+    border-radius: 0 0 6px 6px;
+    z-index: 200;
+    max-height: 250px;
+    overflow-y: auto;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+
+.autocomplete-item {
+    padding: 0.5rem 0.75rem;
+    cursor: pointer;
+    font-size: 0.9rem;
+    color: var(--text);
+}
+
+.autocomplete-item:hover,
+.autocomplete-item.highlighted {
+    background: var(--bg-input);
+    color: var(--accent-hover);
+}
+
+/* Search help */
+.search-help {
+    margin-bottom: 1rem;
+}
+
+.search-help summary {
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+
+.search-help summary:hover {
+    color: var(--text);
+}
+
+.help-content {
+    margin-top: 0.5rem;
+    padding: 0.75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.85rem;
+    line-height: 1.8;
+}
+
+.help-content code {
+    background: var(--bg-input);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: monospace;
+    color: var(--accent-hover);
+}
+
+.result-count {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    align-self: center;
+    white-space: nowrap;
+}
+
+/* Responsive controls */
+@media (max-width: 768px) {
+    .controls-bar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .sort-controls,
+    .page-controls {
+        justify-content: center;
+    }
+
+    .pagination .btn {
+        padding: 0.25rem 0.5rem;
+        font-size: 0.8rem;
+        min-width: 1.5rem;
+    }
+}

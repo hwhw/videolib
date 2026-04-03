@@ -16,7 +16,7 @@ import (
 	"videolib/models"
 )
 
-var videoExtensions = map[string]bool{
+var DefaultVideoExtensions = map[string]bool{
 	".mp4": true, ".mkv": true, ".avi": true, ".mov": true,
 	".wmv": true, ".flv": true, ".webm": true, ".m4v": true,
 	".mpg": true, ".mpeg": true, ".3gp": true, ".ogv": true,
@@ -30,6 +30,7 @@ type Scanner struct {
 	thumbDir   string
 	thumbCount int
 	fileFilter string
+	extensions map[string]bool
 }
 
 type ScanResult struct {
@@ -46,11 +47,43 @@ func New(database *db.Database, roots []string, thumbDir string) *Scanner {
 		roots:      roots,
 		thumbDir:   thumbDir,
 		thumbCount: 16,
+		extensions: DefaultVideoExtensions,
 	}
 }
 
+// SetFileFilter restricts scanning to a single filename within the root directories
 func (s *Scanner) SetFileFilter(filename string) {
 	s.fileFilter = filename
+}
+
+// SetExtensions replaces the video extension list
+func (s *Scanner) SetExtensions(exts []string) {
+	m := make(map[string]bool, len(exts))
+	for _, ext := range exts {
+		ext = strings.ToLower(strings.TrimSpace(ext))
+		if ext != "" {
+			if ext[0] != '.' {
+				ext = "." + ext
+			}
+			m[ext] = true
+		}
+	}
+	if len(m) > 0 {
+		s.extensions = m
+	}
+}
+
+// AddExtensions adds extensions to the existing list
+func (s *Scanner) AddExtensions(exts []string) {
+	for _, ext := range exts {
+		ext = strings.ToLower(strings.TrimSpace(ext))
+		if ext != "" {
+			if ext[0] != '.' {
+				ext = "." + ext
+			}
+			s.extensions[ext] = true
+		}
+	}
 }
 
 func (s *Scanner) isVideoFile(path string, info os.FileInfo) bool {
@@ -58,7 +91,7 @@ func (s *Scanner) isVideoFile(path string, info os.FileInfo) bool {
 		return false
 	}
 	ext := strings.ToLower(filepath.Ext(path))
-	if !videoExtensions[ext] {
+	if !s.extensions[ext] {
 		return false
 	}
 	if s.fileFilter != "" && filepath.Base(path) != s.fileFilter {
@@ -91,7 +124,6 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 	log.Printf("Found %d video files on disk", len(diskFiles))
 	result.Total = len(diskFiles)
 
-	// Get existing paths to detect already-known files
 	existingPaths, err := s.database.GetAllPaths()
 	if err != nil {
 		return nil, fmt.Errorf("reading existing paths: %w", err)
@@ -123,10 +155,8 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 			continue
 		}
 
-		// Check if this hash already exists (file was renamed/moved)
 		existing, existErr := s.database.GetVideo(hash)
 		if existErr == nil {
-			// Hash known — update path, keep tags/thumbs/main_thumb
 			oldPath := existing.Path
 			existing.Path = filepath.Clean(item.path)
 			existing.Filename = filepath.Base(item.path)
@@ -145,7 +175,6 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 			continue
 		}
 
-		// Truly new file
 		video, err := s.buildVideo(hash, item.path, item.info)
 		if err != nil {
 			log.Printf("Error processing %s: %v", item.path, err)

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -306,6 +307,9 @@ func sanitizeFTSQuery(input string) string {
 			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
 				(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' {
 				current.WriteByte(ch)
+			} else if inQuote && ch == ' ' {
+				// Allow spaces inside quotes for FTS phrase
+				current.WriteByte(' ')
 			}
 		}
 	}
@@ -323,6 +327,20 @@ func sanitizeFTSQuery(input string) string {
 
 // === Tag Query Engine ===
 
+// SearchByQuery parses and executes a structured search query.
+// Syntax:
+//   word              - FTS on filename/path (supports word* prefix)
+//   "exact phrase"    - FTS phrase search
+//   tag:value         - videos with tag exactly matching "value"
+//   tag:val*          - videos with tag matching "val%" (wildcard)
+//   duration:+1:30    - videos >= 90 seconds
+//   duration:-60      - videos < 60 seconds
+//   size:+100m        - videos >= 100 MiB
+//   size:-1g          - videos < 1 GiB
+//   UNTAGGED          - videos with no tags
+//   TAGGED            - videos with at least one tag
+//   AND, OR, NOT      - boolean operators (AND is implicit between terms)
+//   ( )               - grouping
 func (d *Database) SearchByQuery(query string) ([]*models.Video, error) {
 	tokens := tokenizeQuery(query)
 	if len(tokens) == 0 {
@@ -356,8 +374,11 @@ func (d *Database) SearchByQuery(query string) ([]*models.Video, error) {
 type tokenType int
 
 const (
-	tokWord   tokenType = iota
-	tokTag
+	tokWord     tokenType = iota
+	tokPhrase             // "quoted phrase"
+	tokTag                // tag:value
+	tokDuration           // duration:+90 or duration:-1:30:00
+	tokSize               // size:+100m or size:-1g
 	tokAnd
 	tokOr
 	tokNot
@@ -376,11 +397,13 @@ func tokenizeQuery(input string) []token {
 	i := 0
 
 	for i < len(input) {
+		// Skip whitespace
 		if input[i] == ' ' || input[i] == '\t' {
 			i++
 			continue
 		}
 
+		// Parentheses
 		if input[i] == '(' {
 			tokens = append(tokens, token{tokLParen, "("})
 			i++
@@ -392,8 +415,28 @@ func tokenizeQuery(input string) []token {
 			continue
 		}
 
+		// Quoted phrase
+		if input[i] == '"' {
+			i++ // skip opening quote
+			start := i
+			for i < len(input) && input[i] != '"' {
+				i++
+			}
+			phrase := input[start:i]
+			if i < len(input) {
+				i++ // skip closing quote
+			}
+			phrase = strings.TrimSpace(phrase)
+			if phrase != "" {
+				tokens = append(tokens, token{tokPhrase, phrase})
+			}
+			continue
+		}
+
+		// Read a word (until space, paren, or quote)
 		start := i
-		for i < len(input) && input[i] != ' ' && input[i] != '\t' && input[i] != '(' && input[i] != ')' {
+		for i < len(input) && input[i] != ' ' && input[i] != '\t' &&
+			input[i] != '(' && input[i] != ')' && input[i] != '"' {
 			i++
 		}
 
@@ -409,9 +452,13 @@ func tokenizeQuery(input string) []token {
 			tokens = append(tokens, token{tokNot, "NOT"})
 		default:
 			lower := strings.ToLower(word)
+
 			if strings.HasPrefix(lower, "tag:") && len(lower) > 4 {
-				tagValue := lower[4:]
-				tokens = append(tokens, token{tokTag, tagValue})
+				tokens = append(tokens, token{tokTag, lower[4:]})
+			} else if strings.HasPrefix(lower, "duration:") && len(lower) > 9 {
+				tokens = append(tokens, token{tokDuration, lower[9:]})
+			} else if strings.HasPrefix(lower, "size:") && len(lower) > 5 {
+				tokens = append(tokens, token{tokSize, lower[5:]})
 			} else {
 				tokens = append(tokens, token{tokWord, word})
 			}
@@ -481,7 +528,9 @@ func (p *queryParser) parseAnd() (string, []interface{}, error) {
 
 		if t.typ == tokAnd {
 			p.next()
-		} else if t.typ == tokWord || t.typ == tokTag || t.typ == tokNot || t.typ == tokLParen {
+		} else if t.typ == tokWord || t.typ == tokPhrase || t.typ == tokTag ||
+			t.typ == tokDuration || t.typ == tokSize ||
+			t.typ == tokNot || t.typ == tokLParen {
 			// implicit AND
 		} else {
 			break
@@ -523,6 +572,7 @@ func (p *queryParser) parseAtom() (string, []interface{}, error) {
 		return "", nil, fmt.Errorf("unexpected end of query")
 	}
 
+	// Parenthesized sub-expression
 	if t.typ == tokLParen {
 		p.next()
 		expr, args, err := p.parseExpression()
@@ -536,6 +586,7 @@ func (p *queryParser) parseAtom() (string, []interface{}, error) {
 		return expr, args, nil
 	}
 
+	// Tag search
 	if t.typ == tokTag {
 		p.next()
 		tagValue := t.val
@@ -546,6 +597,30 @@ func (p *queryParser) parseAtom() (string, []interface{}, error) {
 		return "v.hash IN (SELECT hash FROM tags WHERE tag = ?)", []interface{}{tagValue}, nil
 	}
 
+	// Duration filter
+	if t.typ == tokDuration {
+		p.next()
+		return parseDurationFilter(t.val)
+	}
+
+	// Size filter
+	if t.typ == tokSize {
+		p.next()
+		return parseSizeFilter(t.val)
+	}
+
+	// Quoted phrase -> FTS phrase search
+	if t.typ == tokPhrase {
+		p.next()
+		ftsPhrase := sanitizeFTSPhrase(t.val)
+		if ftsPhrase == "" {
+			return "1=1", nil, nil
+		}
+		return `v.hash IN (SELECT hash FROM videos_fts WHERE videos_fts MATCH ?)`,
+			[]interface{}{ftsPhrase}, nil
+	}
+
+	// Plain word
 	if t.typ != tokWord {
 		return "", nil, fmt.Errorf("unexpected token: %s", t.val)
 	}
@@ -571,6 +646,7 @@ func (p *queryParser) parseAtom() (string, []interface{}, error) {
 		[]interface{}{ftsWord}, nil
 }
 
+// sanitizeFTSWord cleans a single word for FTS5 query
 func sanitizeFTSWord(word string) string {
 	var b strings.Builder
 	for _, ch := range word {
@@ -582,6 +658,142 @@ func sanitizeFTSWord(word string) string {
 		}
 	}
 	return b.String()
+}
+
+// sanitizeFTSPhrase cleans a quoted phrase for FTS5 phrase query
+func sanitizeFTSPhrase(phrase string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, ch := range phrase {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' || ch == ' ' {
+			b.WriteRune(ch)
+		}
+	}
+	b.WriteByte('"')
+	result := b.String()
+	if result == `""` {
+		return ""
+	}
+	return result
+}
+
+// parseDurationFilter parses duration:+VALUE or duration:-VALUE
+// VALUE can be: SS, MM:SS, HH:MM:SS
+func parseDurationFilter(val string) (string, []interface{}, error) {
+	if len(val) < 2 {
+		return "", nil, fmt.Errorf("invalid duration filter: %s (need + or - prefix)", val)
+	}
+
+	op := val[0]
+	if op != '+' && op != '-' {
+		return "", nil, fmt.Errorf("invalid duration filter: %s (need + or - prefix)", val)
+	}
+
+	seconds, err := parseDurationValue(val[1:])
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid duration filter: %s: %w", val, err)
+	}
+
+	if op == '+' {
+		return "v.duration >= ?", []interface{}{seconds}, nil
+	}
+	return "v.duration < ?", []interface{}{seconds}, nil
+}
+
+// parseDurationValue parses SS, MM:SS, or HH:MM:SS into total seconds
+func parseDurationValue(s string) (float64, error) {
+	parts := strings.Split(s, ":")
+
+	switch len(parts) {
+	case 1:
+		// Just seconds
+		return strconv.ParseFloat(parts[0], 64)
+
+	case 2:
+		// MM:SS
+		mins, err := strconv.ParseFloat(parts[0], 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid minutes: %s", parts[0])
+		}
+		secs, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid seconds: %s", parts[1])
+		}
+		return mins*60 + secs, nil
+
+	case 3:
+		// HH:MM:SS
+		hours, err := strconv.ParseFloat(parts[0], 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid hours: %s", parts[0])
+		}
+		mins, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid minutes: %s", parts[1])
+		}
+		secs, err := strconv.ParseFloat(parts[2], 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid seconds: %s", parts[2])
+		}
+		return hours*3600 + mins*60 + secs, nil
+
+	default:
+		return 0, fmt.Errorf("invalid duration format: %s (use SS, MM:SS, or HH:MM:SS)", s)
+	}
+}
+
+// parseSizeFilter parses size:+VALUE or size:-VALUE
+// VALUE can be a number with optional suffix: k, m, g (binary: KiB, MiB, GiB)
+func parseSizeFilter(val string) (string, []interface{}, error) {
+	if len(val) < 2 {
+		return "", nil, fmt.Errorf("invalid size filter: %s (need + or - prefix)", val)
+	}
+
+	op := val[0]
+	if op != '+' && op != '-' {
+		return "", nil, fmt.Errorf("invalid size filter: %s (need + or - prefix)", val)
+	}
+
+	bytes, err := parseSizeValue(val[1:])
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid size filter: %s: %w", val, err)
+	}
+
+	if op == '+' {
+		return "v.size >= ?", []interface{}{bytes}, nil
+	}
+	return "v.size < ?", []interface{}{bytes}, nil
+}
+
+// parseSizeValue parses a number with optional k/m/g suffix
+func parseSizeValue(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty size value")
+	}
+
+	var multiplier int64 = 1
+	last := strings.ToLower(s[len(s)-1:])
+
+	switch last {
+	case "k":
+		multiplier = 1024
+		s = s[:len(s)-1]
+	case "m":
+		multiplier = 1024 * 1024
+		s = s[:len(s)-1]
+	case "g":
+		multiplier = 1024 * 1024 * 1024
+		s = s[:len(s)-1]
+	}
+
+	num, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid number: %s", s)
+	}
+
+	return int64(num * float64(multiplier)), nil
 }
 
 // === Simple Tag Operations ===

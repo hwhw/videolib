@@ -17,17 +17,45 @@
         <div class="help-content">
             <p><code>holiday</code> — full-text search in filenames/paths</p>
             <p><code>holiday*</code> — prefix/truncated search</p>
+            <p><code>"beach party"</code> — exact phrase search</p>
             <p><code>tag:test1</code> — videos with tag "test1"</p>
             <p><code>tag:act*</code> — tags matching "act..." (wildcard)</p>
             <p><code>UNTAGGED</code> — videos with no tags</p>
             <p><code>TAGGED</code> — videos with at least one tag</p>
+            <p><code>duration:+1:30</code> — videos ≥ 90 seconds</p>
+            <p><code>duration:-60</code> — videos &lt; 60 seconds</p>
+            <p><code>duration:+1:00:00</code> — videos ≥ 1 hour</p>
+            <p><code>size:+100m</code> — videos ≥ 100 MiB</p>
+            <p><code>size:-1g</code> — videos &lt; 1 GiB</p>
+            <p><code>size:+500k</code> — videos ≥ 500 KiB</p>
             <p><code>tag:action AND tag:comedy</code> — both tags</p>
             <p><code>tag:action OR tag:comedy</code> — either tag</p>
             <p><code>NOT tag:boring</code> — exclude tag</p>
             <p><code>(UNTAGGED OR tag:action) AND NOT tag:boring</code> — grouping</p>
             <p><code>holiday tag:vacation</code> — implicit AND: filename match + tag</p>
+            <p><code>"my video" duration:+5:00 size:-500m</code> — combine all filters</p>
         </div>
     </details>
+</div>
+
+<div class="controls-bar">
+    <div class="sort-controls">
+        <span class="controls-label">Sort:</span>
+        <button class="btn btn-sm sort-btn active" data-sort="filename" onclick="setSort('filename')">Name<span class="sort-arrow"> ▲</span></button>
+	<button class="btn btn-sm sort-btn" data-sort="path" onclick="setSort('path')">Path<span class="sort-arrow"></span></button>
+        <button class="btn btn-sm sort-btn" data-sort="hash" onclick="setSort('hash')">Hash<span class="sort-arrow"></span></button>
+        <button class="btn btn-sm sort-btn" data-sort="added" onclick="setSort('added')">Added<span class="sort-arrow"></span></button>
+        <button class="btn btn-sm sort-btn" data-sort="modified" onclick="setSort('modified')">Modified<span class="sort-arrow"></span></button>
+        <button class="btn btn-sm sort-btn" data-sort="duration" onclick="setSort('duration')">Duration<span class="sort-arrow"></span></button>
+        <button class="btn btn-sm sort-btn" data-sort="size" onclick="setSort('size')">Size<span class="sort-arrow"></span></button>
+    </div>
+    <div class="page-controls">
+        <span class="controls-label">Per page:</span>
+        <button class="btn btn-sm pagesize-btn" data-size="50" onclick="setPageSize(50)">50</button>
+        <button class="btn btn-sm pagesize-btn active" data-size="100" onclick="setPageSize(100)">100</button>
+        <button class="btn btn-sm pagesize-btn" data-size="200" onclick="setPageSize(200)">200</button>
+        <button class="btn btn-sm pagesize-btn" data-size="500" onclick="setPageSize(500)">500</button>
+    </div>
 </div>
 
 <div id="bulkBar" class="bulk-bar hidden">
@@ -37,11 +65,15 @@
     </div>
     <button onclick="bulkAddTags()" class="btn btn-sm btn-primary">+ Add Tags</button>
     <button onclick="bulkRemoveTags()" class="btn btn-sm btn-danger">- Remove Tags</button>
+    <button onclick="selectPage()" class="btn btn-sm btn-secondary">Select Page</button>
     <button onclick="selectAll()" class="btn btn-sm btn-secondary">Select All</button>
     <button onclick="clearSelection()" class="btn btn-sm btn-secondary">Deselect All</button>
 </div>
 
 <div id="videoGrid" class="video-grid">
+</div>
+
+<div id="pagination" class="pagination">
 </div>
 
 {{template "footer" .}}
