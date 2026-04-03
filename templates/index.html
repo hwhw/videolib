@@ -28,12 +28,17 @@
             <p><code>size:+100m</code> — videos ≥ 100 MiB</p>
             <p><code>size:-1g</code> — videos &lt; 1 GiB</p>
             <p><code>size:+500k</code> — videos ≥ 500 KiB</p>
+            <p><code>path:videos/2024/*</code> — path glob (case-sensitive, shell rules: * ? [abc])</p>
+            <p><code>path:"my videos/vacation/*.mp4"</code> — quoted path with spaces</p>
+            <p><code>ipath:*.mkv</code> — case-insensitive path glob</p>
+            <p><code>ipath:videos/comedy/*</code> — case-insensitive directory match</p>
             <p><code>tag:action AND tag:comedy</code> — both tags</p>
             <p><code>tag:action OR tag:comedy</code> — either tag</p>
             <p><code>NOT tag:boring</code> — exclude tag</p>
             <p><code>(UNTAGGED OR tag:action) AND NOT tag:boring</code> — grouping</p>
             <p><code>holiday tag:vacation</code> — implicit AND: filename match + tag</p>
             <p><code>"my video" duration:+5:00 size:-500m</code> — combine all filters</p>
+            <p><code>ipath:*/comedy/* tag:favorite duration:+10:00</code> — combine path, tag, duration</p>
         </div>
     </details>
 </div>

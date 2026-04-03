@@ -379,6 +379,8 @@ const (
 	tokTag                // tag:value
 	tokDuration           // duration:+90 or duration:-1:30:00
 	tokSize               // size:+100m or size:-1g
+	tokPath               // path:some/glob*pattern
+	tokIPath              // ipath:some/glob*pattern (case-insensitive)
 	tokAnd
 	tokOr
 	tokNot
@@ -415,7 +417,7 @@ func tokenizeQuery(input string) []token {
 			continue
 		}
 
-		// Quoted phrase
+		// Quoted phrase (standalone, not after a prefix)
 		if input[i] == '"' {
 			i++ // skip opening quote
 			start := i
@@ -433,16 +435,63 @@ func tokenizeQuery(input string) []token {
 			continue
 		}
 
-		// Read a word (until space, paren, or quote)
+		// Read a word (until space, paren, or standalone quote)
 		start := i
 		for i < len(input) && input[i] != ' ' && input[i] != '\t' &&
-			input[i] != '(' && input[i] != ')' && input[i] != '"' {
+			input[i] != '(' && input[i] != ')' {
+			// If we hit a quote, it might be part of a prefix value like path:"foo bar"
+			if input[i] == '"' {
+				break
+			}
 			i++
 		}
 
 		word := input[start:i]
-		upper := strings.ToUpper(word)
+		lower := strings.ToLower(word)
 
+		// Check if this word is a prefix that expects a value which might be quoted
+		// Prefixes: tag:, duration:, size:, path:, ipath:
+		prefixType, prefixLen := classifyPrefix(lower)
+		if prefixType != tokWord && prefixLen == len(word) {
+			// The prefix ends right at the word boundary — value follows (possibly quoted)
+			val := readPrefixValue(input, &i)
+			if val != "" {
+				switch prefixType {
+				case tokTag:
+					tokens = append(tokens, token{tokTag, strings.ToLower(val)})
+				case tokDuration:
+					tokens = append(tokens, token{tokDuration, strings.ToLower(val)})
+				case tokSize:
+					tokens = append(tokens, token{tokSize, strings.ToLower(val)})
+				case tokPath:
+					tokens = append(tokens, token{tokPath, val})
+				case tokIPath:
+					tokens = append(tokens, token{tokIPath, val})
+				}
+			}
+			continue
+		}
+
+		// Prefix with inline value like tag:foo, duration:+60, path:some/dir/*
+		if prefixType != tokWord && prefixLen < len(word) {
+			val := word[prefixLen:]
+			switch prefixType {
+			case tokTag:
+				tokens = append(tokens, token{tokTag, strings.ToLower(val)})
+			case tokDuration:
+				tokens = append(tokens, token{tokDuration, strings.ToLower(val)})
+			case tokSize:
+				tokens = append(tokens, token{tokSize, strings.ToLower(val)})
+			case tokPath:
+				tokens = append(tokens, token{tokPath, val})
+			case tokIPath:
+				tokens = append(tokens, token{tokIPath, val})
+			}
+			continue
+		}
+
+		// Keywords
+		upper := strings.ToUpper(word)
 		switch upper {
 		case "AND":
 			tokens = append(tokens, token{tokAnd, "AND"})
@@ -451,21 +500,62 @@ func tokenizeQuery(input string) []token {
 		case "NOT":
 			tokens = append(tokens, token{tokNot, "NOT"})
 		default:
-			lower := strings.ToLower(word)
-
-			if strings.HasPrefix(lower, "tag:") && len(lower) > 4 {
-				tokens = append(tokens, token{tokTag, lower[4:]})
-			} else if strings.HasPrefix(lower, "duration:") && len(lower) > 9 {
-				tokens = append(tokens, token{tokDuration, lower[9:]})
-			} else if strings.HasPrefix(lower, "size:") && len(lower) > 5 {
-				tokens = append(tokens, token{tokSize, lower[5:]})
-			} else {
-				tokens = append(tokens, token{tokWord, word})
-			}
+			tokens = append(tokens, token{tokWord, word})
 		}
 	}
 
 	return tokens
+}
+
+// classifyPrefix checks if a lowercase word starts with a known prefix.
+// Returns the token type and the length of the prefix (including the colon).
+func classifyPrefix(lower string) (tokenType, int) {
+	prefixes := []struct {
+		prefix string
+		typ    tokenType
+	}{
+		{"ipath:", tokIPath}, // check before "path:" since it's longer
+		{"path:", tokPath},
+		{"tag:", tokTag},
+		{"duration:", tokDuration},
+		{"size:", tokSize},
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(lower, p.prefix) {
+			return p.typ, len(p.prefix)
+		}
+	}
+	return tokWord, 0
+}
+
+// readPrefixValue reads the value after a prefix like path: which may be quoted.
+// Advances i past the value.
+func readPrefixValue(input string, i *int) string {
+	if *i >= len(input) {
+		return ""
+	}
+
+	// Quoted value
+	if input[*i] == '"' {
+		*i++ // skip opening quote
+		start := *i
+		for *i < len(input) && input[*i] != '"' {
+			*i++
+		}
+		val := input[start:*i]
+		if *i < len(input) {
+			*i++ // skip closing quote
+		}
+		return val
+	}
+
+	// Unquoted: read until space or paren
+	start := *i
+	for *i < len(input) && input[*i] != ' ' && input[*i] != '\t' &&
+		input[*i] != '(' && input[*i] != ')' {
+		*i++
+	}
+	return input[start:*i]
 }
 
 type queryParser struct {
@@ -530,6 +620,7 @@ func (p *queryParser) parseAnd() (string, []interface{}, error) {
 			p.next()
 		} else if t.typ == tokWord || t.typ == tokPhrase || t.typ == tokTag ||
 			t.typ == tokDuration || t.typ == tokSize ||
+			t.typ == tokPath || t.typ == tokIPath ||
 			t.typ == tokNot || t.typ == tokLParen {
 			// implicit AND
 		} else {
@@ -607,6 +698,18 @@ func (p *queryParser) parseAtom() (string, []interface{}, error) {
 	if t.typ == tokSize {
 		p.next()
 		return parseSizeFilter(t.val)
+	}
+
+	// Path glob (case-sensitive)
+	if t.typ == tokPath {
+		p.next()
+		return parsePathFilter(t.val, false)
+	}
+
+	// Path glob (case-insensitive)
+	if t.typ == tokIPath {
+		p.next()
+		return parsePathFilter(t.val, true)
 	}
 
 	// Quoted phrase -> FTS phrase search
@@ -794,6 +897,65 @@ func parseSizeValue(s string) (int64, error) {
 	}
 
 	return int64(num * float64(multiplier)), nil
+}
+
+// parsePathFilter converts a shell glob pattern to a SQL GLOB or LIKE query on v.path.
+// Shell glob rules: * matches any chars, ? matches single char, [abc] matches character class.
+// SQLite GLOB uses the same rules natively, so we pass through directly.
+// For case-insensitive mode, we convert to LIKE with % and _ and lowercase both sides.
+func parsePathFilter(pattern string, caseInsensitive bool) (string, []interface{}, error) {
+	if pattern == "" {
+		return "1=1", nil, nil
+	}
+
+	if caseInsensitive {
+		// Convert glob to LIKE pattern:
+		// * -> %
+		// ? -> _
+		// Character classes [abc] are not supported in LIKE, translate to %
+		likePattern := globToLike(pattern)
+		return "LOWER(v.path) LIKE LOWER(?)", []interface{}{likePattern}, nil
+	}
+
+	// Case-sensitive: use SQLite GLOB directly
+	// SQLite GLOB is case-sensitive and uses * and ? like shell
+	return "v.path GLOB ?", []interface{}{pattern}, nil
+}
+
+// globToLike converts shell glob syntax to SQL LIKE syntax.
+// * -> %, ? -> _, [...]  -> % (simplified), literal % and _ are escaped.
+func globToLike(glob string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(glob) {
+		ch := glob[i]
+		switch ch {
+		case '*':
+			b.WriteByte('%')
+		case '?':
+			b.WriteByte('_')
+		case '[':
+			// Skip to closing ] and replace with %
+			j := i + 1
+			for j < len(glob) && glob[j] != ']' {
+				j++
+			}
+			if j < len(glob) {
+				i = j // will be incremented below
+			}
+			b.WriteByte('%')
+		case '%':
+			b.WriteString(`\%`)
+		case '_':
+			b.WriteString(`\_`)
+		case '\\':
+			b.WriteString(`\\`)
+		default:
+			b.WriteByte(ch)
+		}
+		i++
+	}
+	return b.String()
 }
 
 // === Simple Tag Operations ===
