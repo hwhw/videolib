@@ -18,26 +18,50 @@ function api(url, options) {
         });
 }
 
+// === Search: always use the query engine ===
+function doSearch() {
+    var searchInput = document.getElementById('searchInput');
+    var val = searchInput ? searchInput.value.trim() : '';
+
+    if (!val) {
+        loadVideos();
+        return;
+    }
+
+    // Always use the search query engine
+    loadVideos(val);
+}
+
+function searchForTag(tag) {
+    var searchInput = document.getElementById('searchInput');
+    var query = 'tag:' + tag;
+    if (searchInput) searchInput.value = query;
+    loadVideos(query);
+}
+
+function clearSearch() {
+    var si = document.getElementById('searchInput');
+    if (si) si.value = '';
+    loadVideos();
+}
+
 // === Video Loading ===
-function loadVideos(query, tags, search) {
+function loadVideos(searchQuery) {
     var grid = document.getElementById('videoGrid');
     if (!grid) return;
 
     grid.innerHTML = '<div class="loading">Loading videos</div>';
 
     var url = '/api/videos';
-    var params = new URLSearchParams();
-    if (search) params.set('search', search);
-    else if (query) params.set('q', query);
-    if (tags) params.set('tags', tags);
-    var qs = params.toString();
-    if (qs) url += '?' + qs;
+    if (searchQuery) {
+        url += '?search=' + encodeURIComponent(searchQuery);
+    }
 
     api(url).then(function(data) {
         allVideos = data || [];
         renderVideoGrid(allVideos);
     }).catch(function(err) {
-        grid.innerHTML = '<div class="loading">Error: ' + escapeHtml(err.message) + '</div>';
+        grid.innerHTML = '<div style="text-align:center;padding:3rem;color:#aaa">Error: ' + escapeHtml(err.message) + '</div>';
     });
 }
 
@@ -50,14 +74,13 @@ function renderVideoGrid(videos) {
     });
     thumbIntervals = {};
 
+    var countDiv = document.getElementById('resultCount');
+    if (countDiv) countDiv.textContent = (videos && videos.length > 0) ? videos.length + ' videos' : '';
+
     if (!videos || videos.length === 0) {
-        grid.innerHTML = '<div class="loading">No videos found</div>';
+        grid.innerHTML = '<div style="text-align:center;padding:3rem;color:#aaa">No videos found</div>';
         return;
     }
-
-    // Show result count
-    var countDiv = document.getElementById('resultCount');
-    if (countDiv) countDiv.textContent = videos.length + ' videos';
 
     grid.innerHTML = '';
 
@@ -78,7 +101,7 @@ function renderVideoGrid(videos) {
         if (v.tags && v.tags.length > 0) {
             tagsHtml = '<div class="card-tags">' +
                 v.tags.slice(0, 5).map(function(t) {
-                    return '<span class="mini-tag">' + escapeHtml(t) + '</span>';
+                    return '<span class="mini-tag clickable-tag" data-tag="' + escapeHtml(t) + '">' + escapeHtml(t) + '</span>';
                 }).join('') + '</div>';
         }
 
@@ -102,12 +125,14 @@ function renderVideoGrid(videos) {
                 tagsHtml +
             '</div>';
 
+        // Checkbox
         var checkbox = card.querySelector('.select-checkbox');
         checkbox.addEventListener('click', function(e) {
             e.stopPropagation();
             toggleSelect(v.hash);
         });
 
+        // Thumbnail hover
         var thumbContainer = card.querySelector('.thumb-container');
         thumbContainer.addEventListener('mouseenter', function() {
             startThumbCycle(v.hash);
@@ -119,9 +144,28 @@ function renderVideoGrid(videos) {
             window.location.href = '/video/' + v.hash;
         });
 
+        // Card body click -> navigate (but not on tags)
         var cardBody = card.querySelector('.card-body');
-        cardBody.addEventListener('click', function() {
-            window.location.href = '/video/' + v.hash;
+        var cardTitle = card.querySelector('.card-title');
+        var cardMeta = card.querySelector('.card-meta');
+        if (cardTitle) {
+            cardTitle.addEventListener('click', function() {
+                window.location.href = '/video/' + v.hash;
+            });
+        }
+        if (cardMeta) {
+            cardMeta.addEventListener('click', function() {
+                window.location.href = '/video/' + v.hash;
+            });
+        }
+
+        // Clickable tags in card
+        var tagElements = card.querySelectorAll('.clickable-tag');
+        tagElements.forEach(function(el) {
+            el.addEventListener('click', function(e) {
+                e.stopPropagation();
+                searchForTag(el.dataset.tag);
+            });
         });
 
         grid.appendChild(card);
@@ -162,34 +206,6 @@ function stopThumbCycle(hash, defaultThumb) {
     if (img && defaultThumb) {
         img.src = defaultThumb;
     }
-}
-
-// === Search ===
-function doSearch() {
-    var searchInput = document.getElementById('searchInput');
-    var val = searchInput ? searchInput.value.trim() : '';
-
-    if (!val) {
-        loadVideos();
-        return;
-    }
-
-    // Detect if it's an advanced query (contains operators or tag:value patterns)
-    var isAdvanced = /\b(AND|OR|NOT|UNTAGGED)\b/i.test(val) ||
-                     /\w+:\S+/.test(val) ||
-                     /[()]/.test(val);
-
-    if (isAdvanced) {
-        loadVideos(null, null, val);
-    } else {
-        loadVideos(val);
-    }
-}
-
-function clearSearch() {
-    var si = document.getElementById('searchInput');
-    if (si) si.value = '';
-    loadVideos();
 }
 
 // === Selection & Bulk Tagging ===
@@ -317,18 +333,28 @@ function renderTagContainer(tags) {
     container.innerHTML = '';
     tags.forEach(function(t) {
         var span = document.createElement('span');
-        span.className = 'tag';
+        span.className = 'tag clickable-tag';
         span.dataset.tag = t;
-        span.textContent = t + ' ';
+
+        var text = document.createTextNode(t + ' ');
+        span.appendChild(text);
 
         var btn = document.createElement('button');
         btn.className = 'tag-remove';
         btn.innerHTML = '&times;';
-        btn.addEventListener('click', function() {
+        btn.addEventListener('click', function(e) {
+            e.stopPropagation();
             removeTag(currentHash, t);
         });
 
         span.appendChild(btn);
+
+        // Click tag to search for it
+        span.addEventListener('click', function(e) {
+            if (e.target === btn) return;
+            window.location.href = '/?search=' + encodeURIComponent('tag:' + t);
+        });
+
         container.appendChild(span);
     });
 
@@ -407,16 +433,14 @@ function loadSimilarVideos(hash, tags) {
 
     grid.innerHTML = '<div class="loading">Finding similar</div>';
 
-    // Build a query: any of the current tags
-    var tagQueries = tags.map(function(t) {
-        return t.replace(/[()]/g, ''); // sanitize
-    });
-    var searchQuery = tagQueries.map(function(t) { return t; }).join(' OR ');
+    // Build OR query for all current tags
+    var query = tags.map(function(t) {
+        return 'tag:' + t;
+    }).join(' OR ');
 
-    api('/api/videos?search=' + encodeURIComponent(searchQuery)).then(function(videos) {
+    api('/api/videos?search=' + encodeURIComponent(query)).then(function(videos) {
         if (!videos) videos = [];
 
-        // Score by shared tags, exclude current
         var scored = [];
         videos.forEach(function(v) {
             if (v.hash === hash) return;
@@ -431,7 +455,6 @@ function loadSimilarVideos(hash, tags) {
 
         scored.sort(function(a, b) { return b.score - a.score; });
         var similar = scored.slice(0, 12).map(function(s) { return s.video; });
-
         renderSimilarVideos(grid, similar);
     }).catch(function() {
         grid.innerHTML = '<div style="color:var(--text-muted)">Could not load similar videos</div>';
@@ -483,20 +506,20 @@ function loadTagList() {
 
     api('/api/tags').then(function(tags) {
         if (!tags || tags.length === 0) {
-            container.innerHTML = '<div class="loading">No tags yet</div>';
+            container.innerHTML = '<div style="text-align:center;padding:3rem;color:#aaa">No tags yet</div>';
             return;
         }
 
         container.innerHTML = '';
         tags.forEach(function(t) {
             var a = document.createElement('a');
-            a.href = '/?search=' + encodeURIComponent(t.name);
+            a.href = '/?search=' + encodeURIComponent('tag:' + t.name);
             a.className = 'tag-item';
             a.innerHTML = escapeHtml(t.name) + ' <span class="tag-count">' + t.count + '</span>';
             container.appendChild(a);
         });
     }).catch(function() {
-        container.innerHTML = '<div class="loading">Error loading tags</div>';
+        container.innerHTML = '<div style="text-align:center;padding:3rem;color:#aaa">Error loading tags</div>';
     });
 }
 
@@ -524,16 +547,12 @@ document.addEventListener('DOMContentLoaded', function() {
     if (window.location.pathname === '/') {
         var params = new URLSearchParams(window.location.search);
         var searchParam = params.get('search');
-        var tagsParam = params.get('tags');
 
         var searchInput = document.getElementById('searchInput');
 
         if (searchParam) {
             if (searchInput) searchInput.value = searchParam;
-            loadVideos(null, null, searchParam);
-        } else if (tagsParam) {
-            if (searchInput) searchInput.value = tagsParam;
-            loadVideos(null, tagsParam);
+            loadVideos(searchParam);
         } else {
             loadVideos();
         }

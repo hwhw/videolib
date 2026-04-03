@@ -525,3 +525,13 @@ a:hover { color: var(--accent-hover); }
     align-self: center;
     white-space: nowrap;
 }
+
+/* Clickable tags */
+.clickable-tag {
+    cursor: pointer;
+}
+
+.clickable-tag:hover {
+    background: var(--accent) !important;
+    color: white !important;
+}

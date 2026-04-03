@@ -13,15 +13,17 @@
     <details>
         <summary>Search syntax help</summary>
         <div class="help-content">
-            <p><code>action</code> — full-text search in filenames/paths</p>
-            <p><code>action*</code> — prefix/truncated search</p>
-            <p><code>genre:action</code> — exact tag match</p>
-            <p><code>starring:cloon*</code> — tag wildcard</p>
+            <p><code>holiday</code> — full-text search in filenames/paths</p>
+            <p><code>holiday*</code> — prefix/truncated search</p>
+            <p><code>tag:test1</code> — videos with tag "test1"</p>
+            <p><code>tag:act*</code> — tags matching "act..." (wildcard)</p>
             <p><code>UNTAGGED</code> — videos with no tags</p>
-            <p><code>genre:action AND starring:clooney</code> — boolean AND</p>
-            <p><code>genre:action OR genre:comedy</code> — boolean OR</p>
-            <p><code>NOT starring:pitt</code> — exclusion</p>
-            <p><code>(UNTAGGED OR genre:action) AND NOT starring:pitt*</code> — grouping</p>
+            <p><code>TAGGED</code> — videos with at least one tag</p>
+            <p><code>tag:action AND tag:comedy</code> — both tags</p>
+            <p><code>tag:action OR tag:comedy</code> — either tag</p>
+            <p><code>NOT tag:boring</code> — exclude tag</p>
+            <p><code>(UNTAGGED OR tag:action) AND NOT tag:boring</code> — grouping</p>
+            <p><code>holiday tag:vacation</code> — implicit AND: filename match + tag</p>
         </div>
     </details>
 </div>

@@ -20,7 +20,6 @@
         </button>
     </div>
 
-    <!-- Thumbnail picker popup -->
     <div id="thumbPicker" class="thumb-picker hidden">
         <div class="thumb-picker-header">
             <h3>Select Main Thumbnail</h3>
@@ -42,10 +41,11 @@
         <div class="tag-editor">
             <h3>Tags</h3>
             <div id="tagContainer" class="tag-container">
+                {{$hash := .Hash}}
                 {{range .Tags}}
                 <span class="tag" data-tag="{{.}}">
                     {{.}}
-                    <button class="tag-remove" onclick="removeTag('{{$.Hash}}', '{{.}}')">&times;</button>
+                    <button class="tag-remove" onclick="removeTag('{{$hash}}', '{{.}}')">&times;</button>
                 </span>
                 {{end}}
             </div>

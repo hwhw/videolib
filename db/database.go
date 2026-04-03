@@ -320,33 +320,33 @@ func sanitizeFTSQuery(input string) string {
 
 // SearchByQuery parses and executes a structured search query.
 // Syntax:
-//
-//	term            - plain text search on filename/path (FTS)
-//	tag:value       - exact tag match
-//	tag:val*        - tag prefix/wildcard match (SQL LIKE)
-//	UNTAGGED        - videos with no tags
-//	AND, OR, NOT    - boolean operators
-//	( )             - grouping
+//   word            - FTS on filename/path (supports word* prefix)
+//   tag:value       - videos with tag exactly matching "value"
+//   tag:val*        - videos with tag matching "val%" (wildcard)
+//   UNTAGGED        - videos with no tags
+//   TAGGED          - videos with at least one tag
+//   AND, OR, NOT    - boolean operators (AND is implicit between terms)
+//   ( )             - grouping
 //
 // Examples:
-//
-//	action                         -> FTS for "action" in filename
-//	genre:action                   -> tag "genre:action"
-//	genre:act*                     -> tags matching "genre:act%"
-//	(UNTAGGED OR genre:action) AND NOT starring:pitt*
+//   holiday                       -> FTS for "holiday"
+//   tag:test1                     -> videos tagged "test1"
+//   tag:genre:action              -> videos tagged "genre:action"
+//   tag:act*                      -> videos with tags matching "act%"
+//   (UNTAGGED OR tag:action) AND NOT tag:boring
 func (d *Database) SearchByQuery(query string) ([]*models.Video, error) {
 	tokens := tokenizeQuery(query)
 	if len(tokens) == 0 {
 		return d.ListAllVideos()
 	}
 
-	parser := &queryParser{tokens: tokens, pos: 0, db: d}
+	parser := &queryParser{tokens: tokens, pos: 0}
 	sqlWhere, args, err := parser.parseExpression()
 	if err != nil {
 		return nil, fmt.Errorf("query parse error: %w", err)
 	}
 
-	sql := `
+	sqlStr := `
 		SELECT DISTINCT v.hash, v.path, v.filename, v.directory, v.size, v.duration,
 			v.width, v.height, v.thumb_count, v.main_thumb,
 			v.added_at, v.modified_at, v.file_mod_time
@@ -355,25 +355,25 @@ func (d *Database) SearchByQuery(query string) ([]*models.Video, error) {
 		ORDER BY v.filename
 	`
 
-	rows, err := d.db.Query(sql, args...)
+	rows, err := d.db.Query(sqlStr, args...)
 	if err != nil {
-		return nil, fmt.Errorf("search query error: %w\nSQL: %s\nArgs: %v", err, sql, args)
+		return nil, fmt.Errorf("search query error: %w\nSQL: %s\nArgs: %v", err, sqlStr, args)
 	}
 	defer rows.Close()
 
 	return d.scanVideosWithTags(rows)
 }
 
-// Token types for the query parser
 type tokenType int
 
 const (
-	tokWord   tokenType = iota // plain word or tag:value
-	tokAnd                     // AND
-	tokOr                      // OR
-	tokNot                     // NOT
-	tokLParen                  // (
-	tokRParen                  // )
+	tokWord   tokenType = iota
+	tokTag              // tag:value
+	tokAnd
+	tokOr
+	tokNot
+	tokLParen
+	tokRParen
 )
 
 type token struct {
@@ -387,13 +387,11 @@ func tokenizeQuery(input string) []token {
 	i := 0
 
 	for i < len(input) {
-		// Skip whitespace
 		if input[i] == ' ' || input[i] == '\t' {
 			i++
 			continue
 		}
 
-		// Parentheses
 		if input[i] == '(' {
 			tokens = append(tokens, token{tokLParen, "("})
 			i++
@@ -422,7 +420,14 @@ func tokenizeQuery(input string) []token {
 		case "NOT":
 			tokens = append(tokens, token{tokNot, "NOT"})
 		default:
-			tokens = append(tokens, token{tokWord, word})
+			// Check for tag: prefix (case-insensitive)
+			lower := strings.ToLower(word)
+			if strings.HasPrefix(lower, "tag:") && len(lower) > 4 {
+				tagValue := lower[4:] // everything after "tag:"
+				tokens = append(tokens, token{tokTag, tagValue})
+			} else {
+				tokens = append(tokens, token{tokWord, word})
+			}
 		}
 	}
 
@@ -432,8 +437,6 @@ func tokenizeQuery(input string) []token {
 type queryParser struct {
 	tokens []token
 	pos    int
-	db     *Database
-	argIdx int
 }
 
 func (p *queryParser) peek() *token {
@@ -452,7 +455,6 @@ func (p *queryParser) next() *token {
 	return t
 }
 
-// parseExpression handles OR (lowest precedence)
 func (p *queryParser) parseExpression() (string, []interface{}, error) {
 	left, args, err := p.parseAnd()
 	if err != nil {
@@ -464,7 +466,7 @@ func (p *queryParser) parseExpression() (string, []interface{}, error) {
 		if t == nil || t.typ != tokOr {
 			break
 		}
-		p.next() // consume OR
+		p.next()
 
 		right, rightArgs, err := p.parseAnd()
 		if err != nil {
@@ -478,7 +480,6 @@ func (p *queryParser) parseExpression() (string, []interface{}, error) {
 	return left, args, nil
 }
 
-// parseAnd handles AND (medium precedence)
 func (p *queryParser) parseAnd() (string, []interface{}, error) {
 	left, args, err := p.parseUnary()
 	if err != nil {
@@ -491,10 +492,9 @@ func (p *queryParser) parseAnd() (string, []interface{}, error) {
 			break
 		}
 
-		// Implicit AND: next token is a word, NOT, or LPAREN (not OR, not RPAREN)
 		if t.typ == tokAnd {
-			p.next() // consume explicit AND
-		} else if t.typ == tokWord || t.typ == tokNot || t.typ == tokLParen {
+			p.next()
+		} else if t.typ == tokWord || t.typ == tokTag || t.typ == tokNot || t.typ == tokLParen {
 			// implicit AND
 		} else {
 			break
@@ -512,7 +512,6 @@ func (p *queryParser) parseAnd() (string, []interface{}, error) {
 	return left, args, nil
 }
 
-// parseUnary handles NOT (high precedence) and atoms
 func (p *queryParser) parseUnary() (string, []interface{}, error) {
 	t := p.peek()
 	if t == nil {
@@ -520,7 +519,7 @@ func (p *queryParser) parseUnary() (string, []interface{}, error) {
 	}
 
 	if t.typ == tokNot {
-		p.next() // consume NOT
+		p.next()
 		inner, args, err := p.parseUnary()
 		if err != nil {
 			return "", nil, err
@@ -531,16 +530,14 @@ func (p *queryParser) parseUnary() (string, []interface{}, error) {
 	return p.parseAtom()
 }
 
-// parseAtom handles parenthesized expressions and leaf terms
 func (p *queryParser) parseAtom() (string, []interface{}, error) {
 	t := p.peek()
 	if t == nil {
 		return "", nil, fmt.Errorf("unexpected end of query")
 	}
 
-	// Parenthesized sub-expression
 	if t.typ == tokLParen {
-		p.next() // consume (
+		p.next()
 		expr, args, err := p.parseExpression()
 		if err != nil {
 			return "", nil, err
@@ -552,34 +549,35 @@ func (p *queryParser) parseAtom() (string, []interface{}, error) {
 		return expr, args, nil
 	}
 
-	// Must be a word
+	if t.typ == tokTag {
+		p.next()
+		tagValue := t.val
+		if strings.Contains(tagValue, "*") {
+			likePattern := strings.ReplaceAll(tagValue, "*", "%")
+			return "v.hash IN (SELECT hash FROM tags WHERE tag LIKE ?)", []interface{}{likePattern}, nil
+		}
+		return "v.hash IN (SELECT hash FROM tags WHERE tag = ?)", []interface{}{tagValue}, nil
+	}
+
 	if t.typ != tokWord {
 		return "", nil, fmt.Errorf("unexpected token: %s", t.val)
 	}
-	p.next() // consume word
+	p.next()
 
 	word := t.val
+	upper := strings.ToUpper(word)
 
-	// UNTAGGED special keyword
-	if strings.ToUpper(word) == "UNTAGGED" {
+	if upper == "UNTAGGED" {
 		return "v.hash NOT IN (SELECT DISTINCT hash FROM tags)", nil, nil
 	}
 
-	// tag:value pattern
-	if idx := strings.Index(word, ":"); idx > 0 {
-		tagPattern := strings.ToLower(word)
-		// Check for wildcard
-		if strings.Contains(tagPattern, "*") {
-			likePattern := strings.ReplaceAll(tagPattern, "*", "%")
-			return "v.hash IN (SELECT hash FROM tags WHERE tag LIKE ?)", []interface{}{likePattern}, nil
-		}
-		return "v.hash IN (SELECT hash FROM tags WHERE tag = ?)", []interface{}{tagPattern}, nil
+	if upper == "TAGGED" {
+		return "v.hash IN (SELECT DISTINCT hash FROM tags)", nil, nil
 	}
 
-	// Plain word -> full-text search on filename/path
 	ftsWord := sanitizeFTSWord(word)
 	if ftsWord == "" {
-		return "1=1", nil, nil // no-op for empty/invalid words
+		return "1=1", nil, nil
 	}
 
 	return `v.hash IN (SELECT hash FROM videos_fts WHERE videos_fts MATCH ?)`,
@@ -593,7 +591,7 @@ func sanitizeFTSWord(word string) string {
 			(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' {
 			b.WriteRune(ch)
 		} else if ch == '*' {
-			b.WriteRune('*') // FTS5 prefix query
+			b.WriteRune('*')
 		}
 	}
 	return b.String()
