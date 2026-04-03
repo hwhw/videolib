@@ -1,6 +1,3 @@
-## README.md
-
-```markdown
 # videolib
 
 A self-contained video library server with tagging, search, and thumbnail previews. Scans directories for video files, extracts metadata via ffprobe, generates thumbnail strips, and serves a responsive web UI for browsing, searching, and tagging your collection. All data is stored in a local SQLite database. The entire application — including HTML templates, CSS, and JavaScript — compiles into a single binary.
