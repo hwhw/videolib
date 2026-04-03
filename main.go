@@ -17,6 +17,7 @@ import (
 
 	"videolib/db"
 	"videolib/handlers"
+	"videolib/hasher"
 	"videolib/models"
 	"videolib/scanner"
 )
@@ -36,6 +37,7 @@ Commands:
   scrub     Remove stale database entries and orphaned thumbnails
   list      Export video database in JSON or text format
   tags      Add or remove tags for a video by hash
+  hash      Compute content hash of files
 
 General options (available to all commands):
   -db       Database file path (default: videolib.db)
@@ -69,6 +71,8 @@ func main() {
 		cmdList(os.Args[2:])
 	case "tags":
 		cmdTags(os.Args[2:])
+	case "hash":
+		cmdHash(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
 		usage()
@@ -651,6 +655,58 @@ func resolveHash(database *db.Database, prefix string) (string, error) {
 		return matches[0], nil
 	default:
 		return "", fmt.Errorf("ambiguous hash prefix '%s' matches %d videos (use more characters)", prefix, len(matches))
+	}
+}
+
+// === hash ===
+
+func cmdHash(args []string) {
+	fs := flag.NewFlagSet("hash", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: videolib hash [<file> ...]
+
+Compute the content hash of one or more files. This is the same
+hash used internally to identify videos.
+
+If no filenames are given, filenames are read from stdin (one per line).
+Outputs one hash per line. If a file is not found, outputs NOTFOUND.
+
+Examples:
+  videolib hash video.mp4
+  videolib hash *.mp4
+  find . -name '*.mkv' | videolib hash
+  videolib list -format text | cut -f3 | videolib hash
+
+`)
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+
+	var files []string
+	if fs.NArg() > 0 {
+		files = fs.Args()
+	} else {
+		s := bufio.NewScanner(os.Stdin)
+		for s.Scan() {
+			line := strings.TrimSpace(s.Text())
+			if line != "" {
+				files = append(files, line)
+			}
+		}
+	}
+
+	if len(files) == 0 {
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	for _, file := range files {
+		h, err := hasher.HashFile(file)
+		if err != nil {
+			fmt.Println("NOTFOUND")
+		} else {
+			fmt.Println(h)
+		}
 	}
 }
 
