@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"html/template"
 	"io/fs"
 	"log"
@@ -34,6 +35,10 @@ func NewPageHandler(database *db.Database, templateFS fs.FS, title string, readO
 			}
 			return result
 		},
+		"toJS": func(s string) template.JS {
+        b, _ := json.Marshal(s)
+        return template.JS(b)
+    },
 		"urlquery": template.URLQueryEscaper,
 	}
 

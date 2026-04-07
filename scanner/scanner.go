@@ -29,6 +29,7 @@ type Scanner struct {
 	roots      []string
 	thumbDir   string
 	thumbCount int
+	dupeLog    *os.File
 	fileFilter string
 	extensions map[string]bool
 }
@@ -41,12 +42,13 @@ type ScanResult struct {
 	Total   int
 }
 
-func New(database *db.Database, roots []string, thumbDir string) *Scanner {
+func New(database *db.Database, roots []string, thumbDir string, dupeLog *os.File) *Scanner {
 	return &Scanner{
 		database:   database,
 		roots:      roots,
 		thumbDir:   thumbDir,
 		thumbCount: 16,
+		dupeLog:    dupeLog,
 		extensions: DefaultVideoExtensions,
 	}
 }
@@ -170,6 +172,9 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 				result.Errors++
 			} else {
 				log.Printf("Updated path: %s -> %s (hash %s)", oldPath, item.path, hash[:12])
+				if s.dupeLog != nil {
+					fmt.Fprintf(s.dupeLog, "%s %s\n%s %s\n", hash, oldPath, hash, item.path);
+				}
 				result.Updated++
 			}
 			continue

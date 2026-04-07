@@ -120,6 +120,7 @@ func cmdScan(args []string) {
 	thumbDir := fs.String("thumbs", "thumbnails", "Thumbnail directory")
 	extList := fs.String("ext", "", "Override video extensions (comma-separated)")
 	addExt := fs.String("add-ext", "", "Add extra extensions to defaults (comma-separated)")
+	dupeLogFile := fs.String("dupe-log", "", "log duplicate video files to this file")
 	fs.Parse(args)
 	paths := fs.Args()
 	if len(paths) == 0 { fs.Usage(); os.Exit(1) }
@@ -127,6 +128,9 @@ func cmdScan(args []string) {
 	database, err := db.Open(*dbPath)
 	if err != nil { log.Fatalf("Cannot open database: %v", err) }
 	defer database.Close()
+	var dupeLog *os.File
+	dupeLog, _ = os.Create(*dupeLogFile)
+	defer dupeLog.Close()
 	var overrideExts, extraExts []string
 	if *extList != "" { overrideExts = strings.Split(*extList, ",") }
 	if *addExt != "" { extraExts = strings.Split(*addExt, ",") }
@@ -139,9 +143,9 @@ func cmdScan(args []string) {
 		}
 		var s *scanner.Scanner
 		if info.IsDir() {
-			s = scanner.New(database, []string{filepath.Clean(path)}, *thumbDir)
+			s = scanner.New(database, []string{filepath.Clean(path)}, *thumbDir, dupeLog)
 		} else {
-			s = scanner.New(database, []string{filepath.Dir(filepath.Clean(path))}, *thumbDir)
+			s = scanner.New(database, []string{filepath.Dir(filepath.Clean(path))}, *thumbDir, dupeLog)
 			s.SetFileFilter(filepath.Base(path))
 		}
 		if len(overrideExts) > 0 { s.SetExtensions(overrideExts) }

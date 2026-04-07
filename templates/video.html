@@ -95,8 +95,8 @@
     var currentHash = "{{.Hash}}";
     var currentTags = [{{range $i, $t := .Tags}}{{if $i}},{{end}}"{{$t}}"{{end}}];
     var currentMainThumb = {{.MainThumbIndex}};
-    var currentTitle = {{.Title | printf "%q"}};
-    var currentDescription = {{.Description | printf "%q"}};
+    var currentTitle = {{.Title | toJS}};
+    var currentDescription = {{.Description | toJS}};
 
     document.addEventListener('DOMContentLoaded', function() {
         if (currentTags.length > 0) {
