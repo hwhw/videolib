@@ -10,6 +10,7 @@ var currentPage = 1;
 var pageSize = 100;
 var sortField = 'filename';
 var sortDir = 'asc';
+var hashSeed = '';
 
 // === API Helpers ===
 function api(url, options) {
@@ -390,6 +391,18 @@ function updateSortButtons() {
         var arrow = btn.querySelector('.sort-arrow');
         if (arrow) arrow.textContent = f === sortField ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
     });
+    var si = document.getElementById('hashSeedInput');
+    if (si) si.classList.toggle('hidden', sortField !== 'hash');
+}
+
+function hashSeedKey(hash) {
+    var s = hashSeed + '\n' + hash;
+    var h = 2166136261 >>> 0;
+    for (var i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(16).padStart(8, '0') + hash;
 }
 
 function sortVideos(videos) {
@@ -397,7 +410,10 @@ function sortVideos(videos) {
     sorted.sort(function(a, b) {
         var va, vb;
         switch (sortField) {
-            case 'hash': va = a.hash; vb = b.hash; break;
+            case 'hash':
+                if (hashSeed) { va = hashSeedKey(a.hash); vb = hashSeedKey(b.hash); }
+                else          { va = a.hash;            vb = b.hash; }
+                break;
             case 'filename': va = (a.title || a.filename || '').toLowerCase(); vb = (b.title || b.filename || '').toLowerCase(); break;
             case 'path': va = (a.path || '').toLowerCase(); vb = (b.path || '').toLowerCase(); break;
             case 'added': va = a.added_at || ''; vb = b.added_at || ''; break;
@@ -485,6 +501,52 @@ function getDisplayName(v) {
     return v.title || v.filename || '';
 }
 
+function createVideoCard(v, opts) {
+    opts = opts || {};
+    var showCheckbox = opts.showCheckbox !== false;
+    var card = document.createElement('div');
+    card.className = 'video-card' + (selectedHashes.has(v.hash) ? ' selected' : '');
+    card.id = 'card-' + v.hash;
+    var hasThumb = v.thumb_count && v.thumb_count > 0;
+    var mainIdx = (v.main_thumb >= 0 && v.main_thumb < v.thumb_count) ? v.main_thumb : 0;
+    var thumbUrl = hasThumb ? '/thumbs/' + v.hash + '/thumb_' + String(mainIdx).padStart(2, '0') + '.jpg' : '';
+    var displayName = getDisplayName(v);
+
+    var tagsHtml = '';
+    if (v.tags && v.tags.length > 0) {
+        tagsHtml = '<div class="card-tags">' + v.tags.slice(0, 5).map(function(t) {
+            return '<span class="mini-tag clickable-tag" data-tag="' + escapeHtml(t) + '">' + escapeHtml(t) + '</span>';
+        }).join('') + '</div>';
+    }
+
+    card.innerHTML =
+        (showCheckbox ? '<input type="checkbox" class="select-checkbox" ' + (selectedHashes.has(v.hash) ? 'checked' : '') + '>' : '') +
+        '<div class="thumb-container">' +
+            (hasThumb ? '<img id="thumb-' + v.hash + '" src="' + thumbUrl + '" alt="" loading="lazy">' :
+                '<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#666">No thumbnail</div>') +
+            '<span class="duration-badge">' + formatDuration(v.duration) + '</span>' +
+        '</div>' +
+        '<div class="card-body">' +
+            '<div class="card-title" title="' + escapeHtml(displayName) + '">' + escapeHtml(displayName) + '</div>' +
+            '<div class="card-meta">' + escapeHtml(v.directory) + '</div>' +
+            tagsHtml +
+        '</div>';
+
+    if (showCheckbox) {
+        card.querySelector('.select-checkbox').addEventListener('click', function(e) { e.stopPropagation(); toggleSelect(v.hash); });
+    }
+    var tc = card.querySelector('.thumb-container');
+    setupThumbInteraction(tc, v.hash, thumbUrl);
+    var ct = card.querySelector('.card-title');
+    if (ct) { ct.style.cursor = 'pointer'; ct.addEventListener('click', function() { window.location.href = '/video/' + v.hash; }); }
+    var cm = card.querySelector('.card-meta');
+    if (cm) { cm.style.cursor = 'pointer'; cm.addEventListener('click', function() { window.location.href = '/video/' + v.hash; }); }
+    card.querySelectorAll('.clickable-tag').forEach(function(el) {
+        el.addEventListener('click', function(e) { e.stopPropagation(); searchForTag(el.dataset.tag); });
+    });
+    return card;
+}
+
 function renderVideoGrid(videos) {
     var grid = document.getElementById('videoGrid');
     if (!grid) return;
@@ -507,45 +569,7 @@ function renderVideoGrid(videos) {
     grid.innerHTML = '';
 
     pv.forEach(function(v) {
-        var card = document.createElement('div');
-        card.className = 'video-card' + (selectedHashes.has(v.hash) ? ' selected' : '');
-        card.id = 'card-' + v.hash;
-        var hasThumb = v.thumb_count && v.thumb_count > 0;
-        var mainIdx = (v.main_thumb >= 0 && v.main_thumb < v.thumb_count) ? v.main_thumb : 0;
-        var thumbUrl = hasThumb ? '/thumbs/' + v.hash + '/thumb_' + String(mainIdx).padStart(2, '0') + '.jpg' : '';
-        var displayName = getDisplayName(v);
-
-        var tagsHtml = '';
-        if (v.tags && v.tags.length > 0) {
-            tagsHtml = '<div class="card-tags">' + v.tags.slice(0, 5).map(function(t) {
-                return '<span class="mini-tag clickable-tag" data-tag="' + escapeHtml(t) + '">' + escapeHtml(t) + '</span>';
-            }).join('') + '</div>';
-        }
-
-        card.innerHTML =
-            '<input type="checkbox" class="select-checkbox" ' + (selectedHashes.has(v.hash) ? 'checked' : '') + '>' +
-            '<div class="thumb-container">' +
-                (hasThumb ? '<img id="thumb-' + v.hash + '" src="' + thumbUrl + '" alt="" loading="lazy">' :
-                    '<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#666">No thumbnail</div>') +
-                '<span class="duration-badge">' + formatDuration(v.duration) + '</span>' +
-            '</div>' +
-            '<div class="card-body">' +
-                '<div class="card-title" title="' + escapeHtml(displayName) + '">' + escapeHtml(displayName) + '</div>' +
-                '<div class="card-meta">' + escapeHtml(v.directory) + '</div>' +
-                tagsHtml +
-            '</div>';
-
-        card.querySelector('.select-checkbox').addEventListener('click', function(e) { e.stopPropagation(); toggleSelect(v.hash); });
-        var tc = card.querySelector('.thumb-container');
-        setupThumbInteraction(tc, v.hash, thumbUrl);
-        var ct = card.querySelector('.card-title');
-        if (ct) { ct.style.cursor = 'pointer'; ct.addEventListener('click', function() { window.location.href = '/video/' + v.hash; }); }
-        var cm = card.querySelector('.card-meta');
-        if (cm) { cm.style.cursor = 'pointer'; cm.addEventListener('click', function() { window.location.href = '/video/' + v.hash; }); }
-        card.querySelectorAll('.clickable-tag').forEach(function(el) {
-            el.addEventListener('click', function(e) { e.stopPropagation(); searchForTag(el.dataset.tag); });
-        });
-        grid.appendChild(card);
+        grid.appendChild(createVideoCard(v, {}));
     });
 
     renderPagination(sorted.length);
@@ -706,13 +730,7 @@ function renderSimilarVideos(grid, similar) {
     if (similar.length === 0) { grid.innerHTML = '<div style="color:var(--text-muted)">No similar videos found</div>'; return; }
     grid.innerHTML = '';
     similar.forEach(function(v) {
-        var hasThumb = v.thumb_count && v.thumb_count > 0;
-        var mainIdx = (v.main_thumb >= 0 && v.main_thumb < v.thumb_count) ? v.main_thumb : 0;
-        var thumbUrl = hasThumb ? '/thumbs/'+v.hash+'/thumb_'+String(mainIdx).padStart(2,'0')+'.jpg' : '';
-        var card = document.createElement('div'); card.className = 'video-card'; card.style.cursor = 'pointer';
-        card.addEventListener('click', function() { window.location.href = '/video/'+v.hash; });
-        card.innerHTML = '<div class="thumb-container">'+(hasThumb?'<img src="'+thumbUrl+'" alt="" loading="lazy">':'<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#666">No thumb</div>')+'<span class="duration-badge">'+formatDuration(v.duration)+'</span></div><div class="card-body"><div class="card-title">'+escapeHtml(getDisplayName(v))+'</div></div>';
-        grid.appendChild(card);
+        grid.appendChild(createVideoCard(v, { showCheckbox: false }));
     });
 }
 
@@ -746,6 +764,14 @@ document.addEventListener('DOMContentLoaded', function() {
         var ni = document.getElementById('newTagInput');
         if (ni) { setupAutocomplete(ni, {mode:'tag'}); sanitizeTagInput(ni); ni.addEventListener('keyup', function(e){if(e.key==='Enter')addTagsToVideo();}); }
     });
+
+    var seedInput = document.getElementById('hashSeedInput');
+    if (seedInput) {
+        seedInput.addEventListener('input', function() {
+            hashSeed = seedInput.value.trim();
+            if (sortField === 'hash') { currentPage = 1; renderVideoGrid(allVideos); }
+        });
+    }
 
     if (window.location.pathname === '/') {
         var params = new URLSearchParams(window.location.search);

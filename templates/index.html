@@ -49,6 +49,8 @@
         <button class="btn btn-sm sort-btn active" data-sort="filename" onclick="setSort('filename')">Name<span class="sort-arrow"> ▲</span></button>
 	<button class="btn btn-sm sort-btn" data-sort="path" onclick="setSort('path')">Path<span class="sort-arrow"></span></button>
         <button class="btn btn-sm sort-btn" data-sort="hash" onclick="setSort('hash')">Hash<span class="sort-arrow"></span></button>
+        <input type="text" id="hashSeedInput" class="seed-input hidden"
+               placeholder="seed" title="Shuffle seed for Hash sort" autocomplete="off">
         <button class="btn btn-sm sort-btn" data-sort="added" onclick="setSort('added')">Added<span class="sort-arrow"></span></button>
         <button class="btn btn-sm sort-btn" data-sort="modified" onclick="setSort('modified')">Modified<span class="sort-arrow"></span></button>
         <button class="btn btn-sm sort-btn" data-sort="duration" onclick="setSort('duration')">Duration<span class="sort-arrow"></span></button>
